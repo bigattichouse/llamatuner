@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Experiment output
+results.csv
+*.results.csv
+
+# Models (never commit multi-GB GGUFs)
+*.gguf
+*.gguf.cb
+
+# Editor / OS
+.DS_Store
+*.swp
