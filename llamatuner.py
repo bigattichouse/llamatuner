@@ -24,6 +24,7 @@ import re
 import struct
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -404,6 +405,42 @@ def parse_bench_json(stdout: str):
     return pp, tg
 
 
+def fmt_dur(secs: float) -> str:
+    secs = int(secs)
+    if secs < 60:
+        return f"{secs}s"
+    if secs < 3600:
+        return f"{secs // 60}m{secs % 60:02d}s"
+    return f"{secs // 3600}h{(secs % 3600) // 60:02d}m"
+
+
+def run_with_progress(cfg: Config, f: dict, timeout: int, prefix: str):
+    """Run one config. On a TTY, show a live elapsed ticker; otherwise print a
+    plain start line so redirected logs stay one-line-in/one-line-out."""
+    if not sys.stdout.isatty():
+        print(prefix + " ...", flush=True)
+        return run_one(cfg, f, timeout)
+
+    stop = threading.Event()
+    t0 = time.time()
+
+    def tick():
+        while not stop.wait(1.0):
+            sys.stdout.write(f"\r{prefix} ... {fmt_dur(time.time() - t0)} "
+                             f"(timeout {fmt_dur(timeout)})   ")
+            sys.stdout.flush()
+
+    th = threading.Thread(target=tick, daemon=True)
+    th.start()
+    try:
+        return run_one(cfg, f, timeout)
+    finally:
+        stop.set()
+        th.join(timeout=0.2)
+        sys.stdout.write("\r" + " " * (len(prefix) + 48) + "\r")  # clear line
+        sys.stdout.flush()
+
+
 def run_one(cfg: Config, f: dict, timeout: int):
     cmd = bench_command(cfg, f)
     t0 = time.time()
@@ -681,17 +718,22 @@ def main():
 
     # --- execute sweep ---
     rows = []
+    sweep_start = time.time()
     for i, run in enumerate(runs, 1):
         f = run["factors"]
         rid = run.get("run_id", i)
-        print(f"\n[{i}/{len(runs)}] run {rid}: "
-              f"ngl={f['ngl']} d={f['n_depth']} t={f['threads']} "
-              f"kv={f['kv_type']} ub={f['ubatch']} ... ", end="", flush=True)
-        res = run_one(cfg, f, args.timeout)
+        prefix = (f"[{i}/{len(runs)}] run {rid}: "
+                  f"ngl={f['ngl']} d={f['n_depth']} t={f['threads']} "
+                  f"kv={f['kv_type']} ub={f['ubatch']}")
+        res = run_with_progress(cfg, f, args.timeout, prefix)
         row = {"run_id": rid, **f, **res}
         rows.append(row)
-        print(f"{res['status']} tg={res['tg_tps']:.1f} t/s "
-              f"pp={res['pp_tps']:.1f} ({res['secs']:.0f}s)")
+        elapsed = time.time() - sweep_start
+        eta = (elapsed / i) * (len(runs) - i)
+        print(f"{prefix} -> {res['status']} "
+              f"tg={res['tg_tps']:.1f} t/s pp={res['pp_tps']:.1f} "
+              f"({res['secs']:.0f}s)  [{i}/{len(runs)} done, "
+              f"elapsed {fmt_dur(elapsed)}, ETA ~{fmt_dur(eta)}]", flush=True)
 
     # persist (columns follow the actual factor set, incl. ncmoe when MoE)
     with open(args.results, "w", newline="") as fh:
