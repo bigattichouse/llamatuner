@@ -198,7 +198,13 @@ python3 llamatuner.py MODEL.gguf [options]
   --llama-bench PATH path to the llama-bench binary
   --timeout SECS     per-run timeout (default: 1200)
   --results PATH     results CSV output (default: results.csv)
+  --resume           skip runs already in --results (rows save incrementally,
+                     so an interrupted sweep can be resumed)
+  --llama-cpp PATH   path to llama.cpp (root or build/bin); also $LLAMA_CPP/$PATH
 ```
+
+Results are written **incrementally** (one row per run, flushed), so a crash or
+timeout never loses completed runs — rerun with `--resume` to finish the rest.
 
 > **Note on run time.** Deep-context configs at low `-ngl` prefill their KV cache
 > on the CPU, which is slow (tens of seconds to minutes per run on a big model).

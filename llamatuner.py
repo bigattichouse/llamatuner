@@ -1004,6 +1004,9 @@ def main():
     ap.add_argument("--timeout", type=int, default=1200,
                     help="per-run timeout in seconds")
     ap.add_argument("--results", type=Path, default=Path("results.csv"))
+    ap.add_argument("--resume", action="store_true",
+                    help="skip configs already present in --results (rows are "
+                         "saved incrementally, so an interrupted sweep resumes)")
     args = ap.parse_args()
 
     if args.selftest:
@@ -1132,35 +1135,62 @@ def main():
             f"$PATH, or pass --{needed.name} directly.")
 
     # --- execute sweep ---
-    rows = []
-    sweep_start = time.time()
-    for i, run in enumerate(runs, 1):
-        f = run["factors"]
-        rid = run.get("run_id", i)
-        nl = cfg.hw.get("n_layers") or "?"
-        prefix = (f"[{i}/{len(runs)}] run {rid}: "
-                  f"{f['ngl']}/{nl} layers on GPU, {f['threads']} threads, "
-                  f"{f['kv_type']} KV cache, {f['n_depth']}-token context, "
-                  f"ubatch {f['ubatch']}")
-        res = run_with_progress(cfg, f, args.timeout, prefix)
-        res["eff_tps"] = effective_tps(cfg.n_prompt, cfg.n_gen,
-                                       res["pp_tps"], res["tg_tps"])
-        row = {"run_id": rid, **f, **res}
-        rows.append(row)
-        elapsed = time.time() - sweep_start
-        eta = (elapsed / i) * (len(runs) - i)
-        print(f"{prefix} -> {res['status']} "
-              f"eff={res['eff_tps']:.1f} t/s (tg={res['tg_tps']:.1f} "
-              f"pp={res['pp_tps']:.1f}) ({res['secs']:.0f}s)  [{i}/{len(runs)} done, "
-              f"elapsed {fmt_dur(elapsed)}, ETA ~{fmt_dur(eta)}]", flush=True)
+    cols = (["run_id"] + list(cfg.factors.keys())
+            + ["pp_tps", "tg_tps", "eff_tps", "status", "secs"])
 
-    # persist (columns follow the actual factor set, incl. ncmoe when MoE)
-    with open(args.results, "w", newline="") as fh:
-        cols = (["run_id"] + list(cfg.factors.keys())
-                + ["pp_tps", "tg_tps", "eff_tps", "status", "secs"])
-        w = csv.DictWriter(fh, fieldnames=cols, extrasaction="ignore")
-        w.writeheader()
-        w.writerows(rows)
+    # Resume keys on run_id (unique per array row), not config values, because
+    # orthogonal arrays can repeat a config across rows (intentional replication).
+    # Assumes resume uses the same factors/array so run_ids line up.
+    rows, done = [], set()
+    if args.resume and args.results.exists():
+        with open(args.results, newline="") as fh:
+            for r in csv.DictReader(fh):
+                for c in ("pp_tps", "tg_tps", "eff_tps", "secs"):
+                    try:
+                        r[c] = float(r[c])
+                    except (KeyError, ValueError, TypeError):
+                        r[c] = 0.0
+                if r.get("run_id"):
+                    rows.append(r)
+                    done.add(str(r["run_id"]))
+        print(f"resuming: {len(done)} run(s) already in {args.results}, "
+              "skipping them")
+
+    fresh = not (args.resume and args.results.exists())
+    fh = open(args.results, "w" if fresh else "a", newline="")
+    writer = csv.DictWriter(fh, fieldnames=cols, extrasaction="ignore")
+    if fresh:
+        writer.writeheader()
+        fh.flush()
+
+    sweep_start = time.time()
+    try:
+        for i, run in enumerate(runs, 1):
+            f = run["factors"]
+            rid = run.get("run_id", i)
+            if str(rid) in done:
+                print(f"[{i}/{len(runs)}] run {rid}: already done, skipping")
+                continue
+            nl = cfg.hw.get("n_layers") or "?"
+            prefix = (f"[{i}/{len(runs)}] run {rid}: "
+                      f"{f['ngl']}/{nl} layers on GPU, {f['threads']} threads, "
+                      f"{f['kv_type']} KV cache, {f['n_depth']}-token context, "
+                      f"ubatch {f['ubatch']}")
+            res = run_with_progress(cfg, f, args.timeout, prefix)
+            res["eff_tps"] = effective_tps(cfg.n_prompt, cfg.n_gen,
+                                           res["pp_tps"], res["tg_tps"])
+            row = {"run_id": rid, **f, **res}
+            rows.append(row)
+            writer.writerow(row)   # incremental save: survive a crash/kill
+            fh.flush()
+            elapsed = time.time() - sweep_start
+            eta = (elapsed / i) * (len(runs) - i)
+            print(f"{prefix} -> {res['status']} "
+                  f"eff={res['eff_tps']:.1f} t/s (tg={res['tg_tps']:.1f} "
+                  f"pp={res['pp_tps']:.1f}) ({res['secs']:.0f}s)  [{i}/{len(runs)} "
+                  f"done, elapsed {fmt_dur(elapsed)}, ETA ~{fmt_dur(eta)}]", flush=True)
+    finally:
+        fh.close()
     print(f"\nwrote {args.results}")
 
     report(cfg, rows)
