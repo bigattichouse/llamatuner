@@ -331,16 +331,12 @@ def generate_runs(factors: dict, array: str | None):
     sys.path.insert(0, str(find_taguchi_binding()))
     from taguchi import Experiment  # noqa: E402
 
-    exp = Experiment()
+    if array and array.lower() == "auto":
+        array = None
+    # The binding takes the array in the constructor; None => auto-select.
+    exp = Experiment(array_type=array)
     for name, levels in factors.items():
         exp.add_factor(name, levels)
-    if array:
-        # Experiment honours an explicit array if the binding supports it;
-        # otherwise it auto-selects. We pass via the .tgu path fallback below.
-        try:
-            exp.set_array(array)
-        except Exception:
-            pass
     runs = exp.generate()
     return exp, runs
 
@@ -661,7 +657,10 @@ def main():
     ap.add_argument("--run", action="store_true",
                     help="actually execute the benchmark sweep (uses the GPU)")
     ap.add_argument("--array", default="L25",
-                    help="Taguchi array (L25, L125, ...); default L25")
+                    help="Taguchi array (L25, L125, ..., or 'auto'); default L25")
+    ap.add_argument("--factor", action="append", default=[], metavar="NAME=v1,v2,...",
+                    help="override a factor's levels (repeatable), e.g. "
+                         "--factor ngl=56,60,64 --factor kv_type=f16,q4_0,q8_0")
     ap.add_argument("--ctx-floor", type=int, default=16384,
                     help="minimum usable context for the BALANCED pick")
     ap.add_argument("--probe-ctx", action="store_true",
@@ -719,6 +718,18 @@ def main():
             "n_experts": n_experts, "n_ctx_train": n_ctx_train, "n_nextn": n_nextn},
     )
     cfg.factors = build_factors(cfg)
+
+    # apply --factor overrides (known factors only)
+    KNOWN = {"ngl", "n_depth", "threads", "kv_type", "ubatch", "ncmoe"}
+    for spec in args.factor:
+        name, _, vals = spec.partition("=")
+        name = name.strip()
+        levels = [v.strip() for v in vals.split(",") if v.strip()]
+        if name not in KNOWN:
+            ap.error(f"--factor: unknown factor '{name}' (known: {sorted(KNOWN)})")
+        if not levels:
+            ap.error(f"--factor {name}: no levels given")
+        cfg.factors[name] = levels
 
     print("=" * 70)
     print("llamatuner")
