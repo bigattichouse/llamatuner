@@ -552,13 +552,12 @@ def fmt_dur(secs: float) -> str:
     return f"{secs // 3600}h{(secs % 3600) // 60:02d}m"
 
 
-def run_with_progress(cfg: Config, f: dict, timeout: int, prefix: str):
-    """Run one config. On a TTY, show a live elapsed ticker; otherwise print a
-    plain start line so redirected logs stay one-line-in/one-line-out."""
+def with_ticker(prefix: str, timeout: int, fn):
+    """Run fn() showing a live elapsed ticker on a TTY; plain start line if the
+    output is redirected (keeps logs one-line-in/one-line-out)."""
     if not sys.stdout.isatty():
         print("trying " + prefix + " ...", flush=True)
-        return drive_one(cfg, f, timeout)
-
+        return fn()
     stop = threading.Event()
     t0 = time.time()
 
@@ -571,12 +570,16 @@ def run_with_progress(cfg: Config, f: dict, timeout: int, prefix: str):
     th = threading.Thread(target=tick, daemon=True)
     th.start()
     try:
-        return drive_one(cfg, f, timeout)
+        return fn()
     finally:
         stop.set()
         th.join(timeout=0.2)
         sys.stdout.write("\r" + " " * (len(prefix) + 56) + "\r")  # clear line
         sys.stdout.flush()
+
+
+def run_with_progress(cfg: Config, f: dict, timeout: int, prefix: str):
+    return with_ticker(prefix, timeout, lambda: drive_one(cfg, f, timeout))
 
 
 def run_one(cfg: Config, f: dict, timeout: int):
@@ -698,68 +701,94 @@ def _measure_round(port: int, prompt, n_gen: int, par: int, timeout: int):
         return res, time.time() - w0
 
 
-def server_run_one(cfg: Config, f: dict, timeout: int):
-    """Launch llama-server for this config, drive real generation (with the
-    requested concurrency), and report effective pp/tg t/s. Failures to load
-    (OOM etc.) become OOM/ERROR like the bench driver."""
+class ServerSession:
+    """A running llama-server, reusable across runs that share load-time params
+    (only the request — prompt length via n_depth — varies). Launch once, issue
+    many measurements, close once."""
+
+    def __init__(self, cfg: Config, launch_f: dict, n_ctx: int, timeout: int):
+        self.cfg = cfg
+        self.ok = False
+        self.err = ""
+        self.port = _free_port()
+        args = build_server_args(cfg, launch_f, self.port, n_ctx)
+        self.proc = subprocess.Popen(args, stdout=subprocess.PIPE,
+                                     stderr=subprocess.PIPE, text=True,
+                                     env=run_env(cfg, launch_f))
+        if _wait_health(self.port, time.time() + timeout):
+            self.ok = True
+        else:
+            self.proc.terminate()
+            try:
+                _, self.err = self.proc.communicate(timeout=10)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+
+    def measure(self, prompt_len, n_gen, par, reps, timeout):
+        prompt = _realistic_prompt(prompt_len)
+        _measure_round(self.port, prompt, n_gen, par, timeout)  # warmup, discard
+        pps, tps = [], []
+        for _ in range(max(1, reps)):
+            res, wall = _measure_round(self.port, prompt, n_gen, par, timeout)
+            if par == 1:
+                tm = res[0].get("timings", {})
+                pps.append(tm.get("prompt_per_second", 0.0) or 0.0)
+                tps.append(tm.get("predicted_per_second", 0.0) or 0.0)
+            else:
+                tg_tok = sum(r.get("timings", {}).get("predicted_n", 0) for r in res)
+                pp_tok = sum(r.get("timings", {}).get("prompt_n", 0) for r in res)
+                tps.append(tg_tok / wall if wall > 0 else 0.0)
+                pps.append(pp_tok / wall if wall > 0 else 0.0)
+        return sum(pps) / len(pps), sum(tps) / len(tps)
+
+    def close(self):
+        if self.proc and self.proc.poll() is None:
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+
+
+def load_key(cfg: Config, f: dict):
+    """Server launch identity: every factor except the request-time n_depth."""
+    return tuple((k, f.get(k)) for k in cfg.factors if k != "n_depth")
+
+
+def measure_in_session(cfg: Config, f: dict, session, timeout: int) -> dict:
+    """Measure one config against an (already-launched) server session."""
+    t0 = time.time()
+    if session is None or not session.ok:
+        err = session.err if session else ""
+        status = "OOM" if _OOM_PAT.search(err or "") else "ERROR"
+        return {"status": status, "pp_tps": 0.0, "tg_tps": 0.0, "secs": 0.0}
+    prompt_len = cfg.n_prompt + int(f.get("n_depth", 0))
     par = int(f.get("parallel", cfg.parallel))
-    # prompt length carries the profile prompt plus any n_depth context factor
+    try:
+        pp, tg = session.measure(prompt_len, cfg.n_gen, par, cfg.reps, timeout)
+    except (urllib.error.URLError, OSError, json.JSONDecodeError):
+        return {"status": "ERROR", "pp_tps": 0.0, "tg_tps": 0.0,
+                "secs": time.time() - t0}
+    return {"status": "OK", "pp_tps": pp, "tg_tps": tg, "secs": time.time() - t0}
+
+
+def server_run_one(cfg: Config, f: dict, timeout: int):
+    """Standalone server measurement for one config (own session). Used by the
+    context probe; the sweep groups configs to reuse sessions instead."""
+    par = int(f.get("parallel", cfg.parallel))
     prompt_len = cfg.n_prompt + int(f.get("n_depth", 0))
     n_ctx = prompt_len + cfg.n_gen + 256
     if par > 1:
-        n_ctx = n_ctx * par  # each slot needs its own context window
-    port = _free_port()
-    args = build_server_args(cfg, f, port, n_ctx)
-    t0 = time.time()
-    proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                            text=True, env=run_env(cfg, f))
+        n_ctx *= par
+    session = ServerSession(cfg, f, n_ctx, timeout)
     try:
-        if not _wait_health(port, time.time() + timeout):
-            proc.terminate()
-            try:
-                _, err = proc.communicate(timeout=10)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                err = ""
-            status = "OOM" if _OOM_PAT.search(err or "") else "ERROR"
-            return {"status": status, "pp_tps": 0.0, "tg_tps": 0.0,
-                    "secs": time.time() - t0}
-
-        prompt = _realistic_prompt(prompt_len)  # varied text for real acceptance
-        reps = max(1, cfg.reps)
-        try:
-            _measure_round(port, prompt, cfg.n_gen, par, timeout)  # warmup, discard
-            pps, tps = [], []
-            for _ in range(reps):
-                res, wall = _measure_round(port, prompt, cfg.n_gen, par, timeout)
-                if par == 1:
-                    tm = res[0].get("timings", {})
-                    pps.append(tm.get("prompt_per_second", 0.0) or 0.0)
-                    tps.append(tm.get("predicted_per_second", 0.0) or 0.0)
-                else:
-                    # aggregate serving throughput = total tokens / wall clock
-                    tg_tok = sum(r.get("timings", {}).get("predicted_n", 0) for r in res)
-                    pp_tok = sum(r.get("timings", {}).get("prompt_n", 0) for r in res)
-                    tps.append(tg_tok / wall if wall > 0 else 0.0)
-                    pps.append(pp_tok / wall if wall > 0 else 0.0)
-        except (urllib.error.URLError, OSError, json.JSONDecodeError):
-            return {"status": "ERROR", "pp_tps": 0.0, "tg_tps": 0.0,
-                    "secs": time.time() - t0}
-
-        pp = sum(pps) / len(pps)
-        tg = sum(tps) / len(tps)
-        return {"status": "OK", "pp_tps": pp, "tg_tps": tg,
-                "secs": time.time() - t0}
+        return measure_in_session(cfg, f, session, timeout)
     finally:
-        proc.terminate()
-        try:
-            proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            proc.kill()
+        session.close()
 
 
 def drive_one(cfg: Config, f: dict, timeout: int):
-    """Dispatch to the configured driver."""
+    """Dispatch to the configured driver (standalone, one process per run)."""
     if cfg.driver == "server":
         return server_run_one(cfg, f, timeout)
     return run_one(cfg, f, timeout)
@@ -1162,7 +1191,12 @@ def main():
     print(f"fixed      : -fa {FIXED_FA}  -mmp {FIXED_MMAP}  -b {FIXED_BATCH}  "
           f"(-p {cfg.n_prompt} -n {cfg.n_gen} -r {cfg.reps})")
 
-    exp, runs = generate_runs(cfg.factors, cfg.array)
+    try:
+        exp, runs = generate_runs(cfg.factors, cfg.array)
+    except Exception as e:
+        ap.error(f"can't build the design for array '{cfg.array}' with "
+                 f"{len(cfg.factors)} factors: {e}\n"
+                 "  Try --array auto (default) to let it pick a fitting array.")
     print(f"\ngenerated {len(runs)} runs "
           f"(array={getattr(exp, 'array_type', cfg.array)})")
 
@@ -1217,32 +1251,80 @@ def main():
         writer.writeheader()
         fh.flush()
 
+    # Execution plan. The server driver groups configs that share load-time
+    # params (only the request — prompt length via n_depth — differs) so one
+    # server serves the whole group. The bench driver runs each config solo.
+    if cfg.driver == "server":
+        groups: dict = {}
+        order = []
+        for run in runs:
+            k = load_key(cfg, run["factors"])
+            if k not in groups:
+                groups[k] = []
+                order.append(k)
+            groups[k].append(run)
+        plan = [groups[k] for k in order]
+        reused = len(runs) - len(plan)
+        if reused > 0:
+            print(f"server reuse: {len(plan)} server launch(es) for {len(runs)} "
+                  f"runs ({reused} reload(s) saved)")
+    else:
+        plan = [[run] for run in runs]
+
     sweep_start = time.time()
+    i = 0
     try:
-        for i, run in enumerate(runs, 1):
-            f = run["factors"]
-            rid = run.get("run_id", i)
-            if str(rid) in done:
-                print(f"[{i}/{len(runs)}] run {rid}: already done, skipping")
-                continue
-            nl = cfg.hw.get("n_layers") or "?"
-            prefix = (f"[{i}/{len(runs)}] run {rid}: "
-                      f"{f['ngl']}/{nl} layers on GPU, {f['threads']} threads, "
-                      f"{f['kv_type']} KV cache, {f['n_depth']}-token context, "
-                      f"ubatch {f['ubatch']}")
-            res = run_with_progress(cfg, f, args.timeout, prefix)
-            res["eff_tps"] = effective_tps(cfg.n_prompt, cfg.n_gen,
-                                           res["pp_tps"], res["tg_tps"])
-            row = {"run_id": rid, **f, **res}
-            rows.append(row)
-            writer.writerow(row)   # incremental save: survive a crash/kill
-            fh.flush()
-            elapsed = time.time() - sweep_start
-            eta = (elapsed / i) * (len(runs) - i)
-            print(f"{prefix} -> {res['status']} "
-                  f"eff={res['eff_tps']:.1f} t/s (tg={res['tg_tps']:.1f} "
-                  f"pp={res['pp_tps']:.1f}) ({res['secs']:.0f}s)  [{i}/{len(runs)} "
-                  f"done, elapsed {fmt_dur(elapsed)}, ETA ~{fmt_dur(eta)}]", flush=True)
+        for group in plan:
+            session = None
+            pending = [r for r in group if str(r.get("run_id", "")) not in done]
+            if cfg.driver == "server" and pending:
+                launch = pending[0]["factors"]
+                par = int(launch.get("parallel", cfg.parallel))
+                max_depth = max(int(r["factors"].get("n_depth", 0)) for r in pending)
+                n_ctx = cfg.n_prompt + max_depth + cfg.n_gen + 256
+                if par > 1:
+                    n_ctx *= par
+                lp = (f"server launch: ngl={launch['ngl']} kv={launch['kv_type']} "
+                      f"ub={launch['ubatch']} ctx={n_ctx}")
+                session = with_ticker(
+                    lp, args.timeout,
+                    lambda lf=launch, nc=n_ctx: ServerSession(cfg, lf, nc, args.timeout))
+            try:
+                for run in group:
+                    i += 1
+                    f = run["factors"]
+                    rid = run.get("run_id", i)
+                    if str(rid) in done:
+                        print(f"[{i}/{len(runs)}] run {rid}: already done, skipping")
+                        continue
+                    nl = cfg.hw.get("n_layers") or "?"
+                    prefix = (f"[{i}/{len(runs)}] run {rid}: "
+                              f"{f['ngl']}/{nl} layers on GPU, {f['threads']} threads, "
+                              f"{f['kv_type']} KV cache, {f['n_depth']}-token context, "
+                              f"ubatch {f['ubatch']}")
+                    if cfg.driver == "server":
+                        res = with_ticker(
+                            prefix, args.timeout,
+                            lambda ff=f, ss=session: measure_in_session(
+                                cfg, ff, ss, args.timeout))
+                    else:
+                        res = run_with_progress(cfg, f, args.timeout, prefix)
+                    res["eff_tps"] = effective_tps(cfg.n_prompt, cfg.n_gen,
+                                                   res["pp_tps"], res["tg_tps"])
+                    row = {"run_id": rid, **f, **res}
+                    rows.append(row)
+                    writer.writerow(row)   # incremental save: survive a crash/kill
+                    fh.flush()
+                    elapsed = time.time() - sweep_start
+                    eta = (elapsed / i) * (len(runs) - i)
+                    print(f"{prefix} -> {res['status']} "
+                          f"eff={res['eff_tps']:.1f} t/s (tg={res['tg_tps']:.1f} "
+                          f"pp={res['pp_tps']:.1f}) ({res['secs']:.0f}s)  "
+                          f"[{i}/{len(runs)} done, elapsed {fmt_dur(elapsed)}, "
+                          f"ETA ~{fmt_dur(eta)}]", flush=True)
+            finally:
+                if session:
+                    session.close()
     finally:
         fh.close()
     print(f"\nwrote {args.results}")

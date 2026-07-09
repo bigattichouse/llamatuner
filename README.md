@@ -258,6 +258,9 @@ roadmap item.
   NextN head) and **multi-user concurrency** (`--parallel N`, aggregate
   throughput). The `multi` profile selects it automatically; force it on any
   profile with `--driver server` (e.g. to measure MTP on a single-user workload).
+  Configs that share load-time params (everything except context depth) **reuse a
+  single server** sized to the group's max context, so it doesn't reload the model
+  for every run.
 
 ```bash
 # measure the real MTP speedup on a single-user workload (UD quant with NextN head)
