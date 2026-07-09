@@ -67,6 +67,19 @@ BENCH_N_PROMPT = 512
 BENCH_N_GEN = 128
 BENCH_REPS = 3
 
+# Workload profiles. Each sets the representative request shape (prompt + gen
+# tokens) that the sweep measures at and scores by, a usable-context floor, and
+# the driver. Objective = effective throughput for that request shape:
+#   (P + G) / (P/pp_tps + G/tg_tps)   -- combines prefill and decode as the
+# workload actually experiences them. "multi" needs the server driver (real
+# concurrency), which llama-bench cannot do.
+PROFILES = {
+    "single": {"n_prompt": 512,  "n_gen": 256, "ctx_floor": 8192,  "driver": "bench"},
+    "agents": {"n_prompt": 8192, "n_gen": 256, "ctx_floor": 32768, "driver": "bench"},
+    "multi":  {"n_prompt": 1024, "n_gen": 256, "ctx_floor": 8192,  "driver": "server",
+               "parallel": [2, 4, 8]},
+}
+
 
 # ---------------------------------------------------------------------------
 # Hardware / model auto-detection
@@ -300,9 +313,20 @@ class Config:
     max_depth: int | None = None  # cap n_depth levels (memory/time budget)
     emit_mtp: bool = True         # add draft-mtp flags to server cmd if supported
     spec_draft_n_max: int = 2     # --spec-draft-n-max for MTP
+    profile: str = "single"       # workload profile (see PROFILES)
+    driver: str = "bench"         # "bench" (llama-bench) or "server" (llama-server)
+    parallel: list = field(default_factory=list)  # concurrency levels (multi)
     factors: dict = field(default_factory=dict)
     hw: dict = field(default_factory=dict)
     env_factor_names: set = field(default_factory=set)  # factors that set env vars
+
+
+def effective_tps(n_prompt: int, n_gen: int, pp: float, tg: float) -> float:
+    """Throughput for a representative request of n_prompt prompt + n_gen gen
+    tokens: total tokens / (prefill time + decode time)."""
+    if pp <= 0 or tg <= 0:
+        return 0.0
+    return (n_prompt + n_gen) / (n_prompt / pp + n_gen / tg)
 
 
 def build_factors(cfg: Config):
@@ -512,15 +536,20 @@ def run_one(cfg: Config, f: dict, timeout: int):
 # ---------------------------------------------------------------------------
 # Reporting
 # ---------------------------------------------------------------------------
+def score_of(r: dict) -> float:
+    """Primary objective score for a run (effective throughput if present)."""
+    return float(r.get("eff_tps", r.get("tg_tps", 0.0)))
+
+
 def pareto_frontier(rows: list[dict]) -> list[dict]:
-    """Non-dominated set maximizing (context depth, tg_tps) among OK rows."""
-    ok = [r for r in rows if r["status"] == "OK" and r["tg_tps"] > 0]
+    """Non-dominated set maximizing (context depth, objective score) among OK."""
+    ok = [r for r in rows if r["status"] == "OK" and score_of(r) > 0]
     frontier = []
     for r in ok:
-        depth, tps = int(r["n_depth"]), r["tg_tps"]
+        depth, s = int(r["n_depth"]), score_of(r)
         dominated = any(
-            int(o["n_depth"]) >= depth and o["tg_tps"] >= tps and o is not r
-            and (int(o["n_depth"]) > depth or o["tg_tps"] > tps)
+            int(o["n_depth"]) >= depth and score_of(o) >= s and o is not r
+            and (int(o["n_depth"]) > depth or score_of(o) > s)
             for o in ok
         )
         if not dominated:
@@ -545,22 +574,22 @@ def report(cfg: Config, rows: list[dict]):
               "draft-mtp\n      speculative decoding. Measured t/s below does NOT "
               "include that boost.")
 
-    fastest = max(ok, key=lambda r: r["tg_tps"])
+    print(f"objective  : effective t/s for a {cfg.profile} request "
+          f"({cfg.n_prompt} prompt + {cfg.n_gen} gen tokens)")
+
+    fastest = max(ok, key=score_of)
     usable = [r for r in ok if int(r["n_depth"]) >= cfg.ctx_floor]
-    longest = max(ok, key=lambda r: (int(r["n_depth"]), r["tg_tps"]))
-    balanced = None
-    if usable:
-        # best t/s among configs that clear the context floor
-        balanced = max(usable, key=lambda r: r["tg_tps"])
+    longest = max(ok, key=lambda r: (int(r["n_depth"]), score_of(r)))
+    balanced = max(usable, key=score_of) if usable else None
 
     def show(title, r):
         if not r:
             print(f"\n### {title}: none met the constraint")
             return
         print(f"\n### {title}")
-        print(f"  tg={r['tg_tps']:.1f} t/s  pp={r['pp_tps']:.1f} t/s  "
-              f"depth={r['n_depth']}  ngl={r['ngl']}  t={r['threads']}  "
-              f"kv={r['kv_type']}  ub={r['ubatch']}")
+        print(f"  eff={score_of(r):.1f} t/s  (tg={r['tg_tps']:.1f}  "
+              f"pp={r['pp_tps']:.1f})  depth={r['n_depth']}  ngl={r['ngl']}  "
+              f"t={r['threads']}  kv={r['kv_type']}  ub={r['ubatch']}")
         # size context to cover the measured depth + a floor, rounded up to a
         # tidy power of two
         need = max(int(r["n_depth"]) + cfg.n_prompt + cfg.n_gen,
@@ -569,14 +598,15 @@ def report(cfg: Config, rows: list[dict]):
         print("  suggested llama-server command:")
         print("    " + server_command(cfg, r, ctx))
 
-    show("FASTEST (max t/s)", fastest)
-    show(f"BALANCED (max t/s with context >= {cfg.ctx_floor})", balanced)
+    show("BEST (max effective t/s)", fastest)
+    show(f"BALANCED (best with context >= {cfg.ctx_floor})", balanced)
     show("LONGEST CONTEXT", longest)
 
-    print("\n### Pareto frontier (context vs t/s)")
+    print("\n### Pareto frontier (context vs effective t/s)")
     for r in pareto_frontier(rows):
-        print(f"  depth={int(r['n_depth']):>6}  tg={r['tg_tps']:6.1f} t/s  "
-              f"ngl={r['ngl']:>3}  kv={r['kv_type']:>4}  ub={r['ubatch']:>4}")
+        print(f"  depth={int(r['n_depth']):>6}  eff={score_of(r):6.1f} t/s  "
+              f"(tg={r['tg_tps']:5.1f})  ngl={r['ngl']:>3}  "
+              f"kv={r['kv_type']:>4}  ub={r['ubatch']:>4}")
 
 
 def taguchi_effects(exp, rows: list[dict]):
@@ -590,15 +620,15 @@ def taguchi_effects(exp, rows: list[dict]):
     # is the intended "failure is data" behaviour. (Caveat: a 0 from a timeout is
     # a censored value, so trust the Pareto for the pick and use main-effects only
     # to rank which factors matter — see README.)
-    results = {int(r["run_id"]): float(r["tg_tps"]) for r in rows}
+    results = {int(r["run_id"]): score_of(r) for r in rows}
     n_failed = sum(1 for r in rows if r["status"] != "OK")
     if len(results) < 3:
         print("\n(not enough runs for main-effects analysis)")
         return
     try:
-        with Analyzer(exp, metric_name="tg_tps") as an:
+        with Analyzer(exp, metric_name="eff_tps") as an:
             an.add_results_from_dict(results)
-            print("\n### Taguchi main effects (tg t/s, higher = better)")
+            print("\n### Taguchi main effects (effective t/s, higher = better)")
             if n_failed:
                 print(f"(note: {n_failed} failed run(s) scored as 0 t/s)")
             print(an.summary())
@@ -691,6 +721,12 @@ def selftest() -> bool:
         assert run_env(cfg, f)["GGML_CUDA_FORCE_MMQ"] == "1"
         cmd2 = bench_command(cfg, {"ubatch": "2048", "batch": "512"})  # clamp b>=ub
         assert cmd2[cmd2.index("-b") + 1] == "2048"
+
+        # effective throughput objective
+        assert effective_tps(512, 256, 0, 100) == 0.0
+        assert abs(effective_tps(512, 256, 1000.0, 100.0)
+                   - 768 / (512 / 1000 + 256 / 100)) < 1e-6
+        assert set(PROFILES) == {"single", "agents", "multi"}
     except AssertionError as e:
         print(f"selftest FAILED: {e}")
         return False
@@ -715,8 +751,12 @@ def main():
     ap.add_argument("--env", action="append", default=[], metavar="NAME=v1,v2,...",
                     help="sweep an environment variable as a factor (repeatable), "
                          "e.g. --env GGML_CUDA_FORCE_MMQ=0,1")
-    ap.add_argument("--ctx-floor", type=int, default=16384,
-                    help="minimum usable context for the BALANCED pick")
+    ap.add_argument("--profile", choices=sorted(PROFILES), default="single",
+                    help="workload profile: single (interactive), agents "
+                         "(big-context tool use), multi (concurrent serving); "
+                         "sets request shape + objective. default: single")
+    ap.add_argument("--ctx-floor", type=int, default=None,
+                    help="minimum usable context for BALANCED (default: from profile)")
     ap.add_argument("--probe-ctx", action="store_true",
                     help="after the sweep, binary-search the max context that "
                          "loads for the fastest config (needs --run)")
@@ -724,10 +764,10 @@ def main():
                     help="run offline logic checks and exit (no GPU, no model)")
     ap.add_argument("--reps", type=int, default=BENCH_REPS,
                     help=f"llama-bench repetitions per config (default {BENCH_REPS})")
-    ap.add_argument("--n-prompt", type=int, default=BENCH_N_PROMPT,
-                    help=f"prompt tokens per measurement (default {BENCH_N_PROMPT})")
-    ap.add_argument("--n-gen", type=int, default=BENCH_N_GEN,
-                    help=f"generated tokens per measurement (default {BENCH_N_GEN})")
+    ap.add_argument("--n-prompt", type=int, default=None,
+                    help="prompt tokens per measurement (default: from profile)")
+    ap.add_argument("--n-gen", type=int, default=None,
+                    help="generated tokens per measurement (default: from profile)")
     ap.add_argument("--max-depth", type=int, default=None,
                     help="cap n_depth factor levels (memory/time budget)")
     ap.add_argument("--no-mtp", action="store_true",
@@ -757,17 +797,26 @@ def main():
     logical = detect_logical_cores()
     vram = detect_vram_mib()
 
+    # resolve request shape from the profile, allowing explicit overrides
+    prof = PROFILES[args.profile]
+    n_prompt = args.n_prompt if args.n_prompt is not None else prof["n_prompt"]
+    n_gen = args.n_gen if args.n_gen is not None else prof["n_gen"]
+    ctx_floor = args.ctx_floor if args.ctx_floor is not None else prof["ctx_floor"]
+
     cfg = Config(
         model=args.model.resolve(),
         llama_bench=args.llama_bench,
         array=args.array,
-        ctx_floor=args.ctx_floor,
+        ctx_floor=ctx_floor,
         reps=args.reps,
-        n_prompt=args.n_prompt,
-        n_gen=args.n_gen,
+        n_prompt=n_prompt,
+        n_gen=n_gen,
         max_depth=args.max_depth,
         emit_mtp=not args.no_mtp,
         spec_draft_n_max=args.spec_draft_n_max,
+        profile=args.profile,
+        driver=prof["driver"],
+        parallel=list(prof.get("parallel", [])),
         hw={"phys": phys, "logical": logical, "n_layers": n_layers, "vram": vram,
             "n_experts": n_experts, "n_ctx_train": n_ctx_train, "n_nextn": n_nextn},
     )
@@ -810,6 +859,8 @@ def main():
         emit = "will add --spec-type draft-mtp to server cmd" if cfg.emit_mtp \
                else "disabled (--no-mtp)"
         print(f"MTP        : yes ({n_nextn} NextN layer(s)) — {emit}")
+    print(f"profile    : {cfg.profile}  (request {cfg.n_prompt} prompt + "
+          f"{cfg.n_gen} gen tokens; driver={cfg.driver})")
     print(f"array      : {cfg.array}   ctx floor: {cfg.ctx_floor}")
     print("\nfactors:")
     for name, levels in cfg.factors.items():
@@ -831,6 +882,10 @@ def main():
               f"(~{est // 60} min at a rough 90s/run).")
         return
 
+    if cfg.driver != "bench":
+        ap.error(f"the '{cfg.profile}' profile uses the '{cfg.driver}' driver, "
+                 "which is not implemented yet; use --profile single or agents")
+
     # --- execute sweep ---
     rows = []
     sweep_start = time.time()
@@ -843,19 +898,21 @@ def main():
                   f"{f['kv_type']} KV cache, {f['n_depth']}-token context, "
                   f"ubatch {f['ubatch']}")
         res = run_with_progress(cfg, f, args.timeout, prefix)
+        res["eff_tps"] = effective_tps(cfg.n_prompt, cfg.n_gen,
+                                       res["pp_tps"], res["tg_tps"])
         row = {"run_id": rid, **f, **res}
         rows.append(row)
         elapsed = time.time() - sweep_start
         eta = (elapsed / i) * (len(runs) - i)
         print(f"{prefix} -> {res['status']} "
-              f"tg={res['tg_tps']:.1f} t/s pp={res['pp_tps']:.1f} "
-              f"({res['secs']:.0f}s)  [{i}/{len(runs)} done, "
+              f"eff={res['eff_tps']:.1f} t/s (tg={res['tg_tps']:.1f} "
+              f"pp={res['pp_tps']:.1f}) ({res['secs']:.0f}s)  [{i}/{len(runs)} done, "
               f"elapsed {fmt_dur(elapsed)}, ETA ~{fmt_dur(eta)}]", flush=True)
 
     # persist (columns follow the actual factor set, incl. ncmoe when MoE)
     with open(args.results, "w", newline="") as fh:
         cols = (["run_id"] + list(cfg.factors.keys())
-                + ["pp_tps", "tg_tps", "status", "secs"])
+                + ["pp_tps", "tg_tps", "eff_tps", "status", "secs"])
         w = csv.DictWriter(fh, fieldnames=cols, extrasaction="ignore")
         w.writeheader()
         w.writerows(rows)
@@ -867,7 +924,7 @@ def main():
     if args.probe_ctx:
         ok = [r for r in rows if r["status"] == "OK"]
         if ok:
-            fastest = max(ok, key=lambda r: r["tg_tps"])
+            fastest = max(ok, key=score_of)
             cap = cfg.hw.get("n_ctx_train") or 131072
             print(f"\n### Max-context probe (fastest config, cap={cap})")
             base = {k: fastest[k] for k in cfg.factors}

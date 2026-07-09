@@ -59,6 +59,24 @@ estimate that flags when the additive main-effects model is breaking down.
 
 ---
 
+## Workload profiles (`--profile`)
+
+A profile expresses *how you use the model* and sets the representative request
+shape the sweep measures at and optimizes for:
+
+| Profile | Request (prompt + gen) | Ctx floor | Driver | For |
+|---------|------------------------|-----------|--------|-----|
+| **single** (default) | 512 + 256 | 8192 | bench | interactive chat/coding |
+| **agents** | 8192 + 256 | 32768 | bench | big-context tool use / RAG |
+| **multi** | 1024 + 256 | 8192 | server | concurrent serving (needs server driver) |
+
+The objective is **effective throughput** for that request —
+`(P + G) / (P/pp_tps + G/tg_tps)` — which weighs prefill and decode the way the
+workload actually experiences them, instead of optimizing raw decode alone. (A
+nice side effect: it no longer degenerates to "zero context is fastest".)
+Override the shape with `--n-prompt/--n-gen/--ctx-floor`. The `multi` profile
+needs the server driver (roadmap) for real concurrency.
+
 ## What it measures
 
 For each config, `llama-bench` reports two throughput numbers, both captured:
@@ -158,8 +176,9 @@ Full per-run data is written to `results.csv`.
 python3 llamatuner.py MODEL.gguf [options]
 
   --run              actually execute the sweep (default: plan/dry-run, no GPU)
-  --array L25|L125   Taguchi array (default: L25)
-  --ctx-floor N      minimum usable context for the BALANCED pick (default: 16384)
+  --profile P        workload profile: single | agents | multi (default: single)
+  --array L25|L125   Taguchi array (default: L25, or 'auto')
+  --ctx-floor N      minimum usable context for BALANCED (default: from profile)
   --probe-ctx        after the sweep, binary-search the largest context that
                      loads for the fastest config (needs --run)
   --selftest         run offline logic checks and exit (no GPU, no model)
