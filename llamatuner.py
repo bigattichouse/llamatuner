@@ -210,6 +210,13 @@ def model_context_length(meta: dict) -> int | None:
     return _meta_int(meta, ".context_length")
 
 
+def model_nextn_layers(meta: dict) -> int:
+    """MTP (multi-token-prediction / NextN) head layers; 0 means no MTP head.
+    Present in e.g. Unsloth Dynamic quants that support draft-mtp speculative
+    decoding in llama-server."""
+    return _meta_int(meta, ".nextn_predict_layers") or 0
+
+
 # ---------------------------------------------------------------------------
 # Factor-level generation
 # ---------------------------------------------------------------------------
@@ -291,6 +298,8 @@ class Config:
     n_prompt: int = BENCH_N_PROMPT
     n_gen: int = BENCH_N_GEN
     max_depth: int | None = None  # cap n_depth levels (memory/time budget)
+    emit_mtp: bool = True         # add draft-mtp flags to server cmd if supported
+    spec_draft_n_max: int = 2     # --spec-draft-n-max for MTP
     factors: dict = field(default_factory=dict)
     hw: dict = field(default_factory=dict)
 
@@ -375,6 +384,12 @@ def server_command(cfg: Config, f: dict, ctx: int) -> str:
     ]
     if "ncmoe" in f:
         parts.append(f"-ncmoe {f['ncmoe']}")
+    # Multi-token prediction: if the model ships a NextN/MTP head, enable
+    # draft-mtp speculative decoding for extra generation throughput. NOTE: the
+    # sweep's measured t/s does NOT include this boost (llama-bench can't do
+    # speculative decoding); it's an additional multiplier on top.
+    if cfg.emit_mtp and cfg.hw.get("n_nextn", 0) > 0:
+        parts.append(f"--spec-type draft-mtp --spec-draft-n-max {cfg.spec_draft_n_max}")
     return " \\\n    ".join(parts)
 
 
@@ -490,6 +505,11 @@ def report(cfg: Config, rows: list[dict]):
             bad[r["status"]] = bad.get(r["status"], 0) + 1
         print("No successful runs. Status breakdown:", bad)
         return
+
+    if cfg.emit_mtp and cfg.hw.get("n_nextn", 0) > 0:
+        print("NOTE: model has an MTP head — the server commands below enable "
+              "draft-mtp\n      speculative decoding. Measured t/s below does NOT "
+              "include that boost.")
 
     fastest = max(ok, key=lambda r: r["tg_tps"])
     usable = [r for r in ok if int(r["n_depth"]) >= cfg.ctx_floor]
@@ -649,6 +669,11 @@ def main():
                     help=f"generated tokens per measurement (default {BENCH_N_GEN})")
     ap.add_argument("--max-depth", type=int, default=None,
                     help="cap n_depth factor levels (memory/time budget)")
+    ap.add_argument("--no-mtp", action="store_true",
+                    help="don't add draft-mtp flags to the emitted server command "
+                         "even if the model has an MTP head")
+    ap.add_argument("--spec-draft-n-max", type=int, default=2,
+                    help="--spec-draft-n-max for MTP speculative decoding (default 2)")
     ap.add_argument("--llama-bench", type=Path, default=DEFAULT_LLAMA_BENCH)
     ap.add_argument("--timeout", type=int, default=1200,
                     help="per-run timeout in seconds")
@@ -666,6 +691,7 @@ def main():
     n_layers = model_block_count(meta)
     n_experts = model_expert_count(meta)
     n_ctx_train = model_context_length(meta)
+    n_nextn = model_nextn_layers(meta)
     phys = detect_physical_cores()
     logical = detect_logical_cores()
     vram = detect_vram_mib()
@@ -679,8 +705,10 @@ def main():
         n_prompt=args.n_prompt,
         n_gen=args.n_gen,
         max_depth=args.max_depth,
+        emit_mtp=not args.no_mtp,
+        spec_draft_n_max=args.spec_draft_n_max,
         hw={"phys": phys, "logical": logical, "n_layers": n_layers, "vram": vram,
-            "n_experts": n_experts, "n_ctx_train": n_ctx_train},
+            "n_experts": n_experts, "n_ctx_train": n_ctx_train, "n_nextn": n_nextn},
     )
     cfg.factors = build_factors(cfg)
 
@@ -695,6 +723,10 @@ def main():
     print(f"VRAM       : {vram} MiB" if vram else "VRAM       : (undetected)")
     if n_ctx_train:
         print(f"native ctx : {n_ctx_train}")
+    if n_nextn:
+        emit = "will add --spec-type draft-mtp to server cmd" if cfg.emit_mtp \
+               else "disabled (--no-mtp)"
+        print(f"MTP        : yes ({n_nextn} NextN layer(s)) — {emit}")
     print(f"array      : {cfg.array}   ctx floor: {cfg.ctx_floor}")
     print("\nfactors:")
     for name, levels in cfg.factors.items():

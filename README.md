@@ -167,6 +167,8 @@ python3 llamatuner.py MODEL.gguf [options]
   --n-prompt N       prompt tokens per measurement (default: 512)
   --n-gen N          generated tokens per measurement (default: 128)
   --max-depth N      cap the n_depth factor levels (memory/time budget)
+  --no-mtp           don't add draft-mtp flags to the server command
+  --spec-draft-n-max N  MTP draft tokens for the server command (default: 2)
   --llama-bench PATH path to the llama-bench binary
   --timeout SECS     per-run timeout (default: 1200)
   --results PATH     results CSV output (default: results.csv)
@@ -191,9 +193,20 @@ factor-level generation, MoE detection, and Pareto logic without a GPU or model.
 - **Max-context probe** (`--probe-ctx`) — after the sweep, binary-searches the largest
   context that loads for the fastest config, capped at the model's native context.
 - **Offline self-test** (`--selftest`) — verifies the core logic without a GPU.
+- **MTP awareness** — detects a NextN/multi-token-prediction head (`<arch>.nextn_predict_layers`,
+  present in e.g. Unsloth Dynamic quants) and appends `--spec-type draft-mtp
+  --spec-draft-n-max N` to the emitted `llama-server` command. **Caveat:** the swept
+  `tg` numbers do *not* include the MTP speedup — `llama-bench` can't do speculative
+  decoding, so MTP is an additional multiplier on top of the measured throughput.
+  See Roadmap for measuring it directly. Toggle with `--no-mtp` / `--spec-draft-n-max`.
 
 ## Roadmap / ideas
 
+- **Server-based benchmark for MTP** — `llama-bench` can't do speculative decoding,
+  so to actually *measure and optimize* MTP we'd spin up `llama-server` with each
+  config, drive real generation through the API, and sweep `--spec-draft-n-max`.
+  This is the only way to capture the acceptance-rate speedup rather than just
+  emitting the flags.
 - **Flash-attn as an outer block** — run the array twice (`-fa 0` / `-fa 1`) to
   quantify flash-attention's effect directly, mindful that quantized KV requires
   `-fa 1`.
