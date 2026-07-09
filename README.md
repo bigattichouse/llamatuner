@@ -183,6 +183,33 @@ python3 llamatuner.py MODEL.gguf [options]
 Run `python3 llamatuner.py --selftest` to verify the JSON parser, OOM detection,
 factor-level generation, MoE detection, and Pareto logic without a GPU or model.
 
+## Advanced: extra factors and environment sweeps
+
+Beyond the default five factors, any llama-bench parameter in the `BENCH_FLAG`
+map can be swept with `--factor`, and any environment variable with `--env`
+(each becomes an orthogonal factor in the design). Both are opt-in, so pick an
+array that fits the new factor count (`--array`, or `auto`).
+
+```bash
+# sweep KV offload location and CPU polling alongside a focused ngl/kv sweep
+python3 llamatuner.py model.gguf --run --array auto \
+  --factor ngl=56,60,64 --factor kv_type=f16,q4_0 \
+  --factor nkvo=0,1 --factor poll=0,50
+
+# gfx906 / ROCm environment tuning (the "10-30%" knobs) as sweepable factors
+python3 llamatuner.py model.gguf --run --array auto \
+  --env GGML_CUDA_FORCE_MMQ=0,1 --env GGML_CUDA_FORCE_CUBLAS=0,1
+```
+
+Env-var factors are applied to each benchmark process (not the command line),
+and the winning values are prepended to the recommended `llama-server` command
+as an env prefix. Sweepable llama-bench factors currently include: `ngl`,
+`n_depth`, `threads`, `kv_type`, `ubatch`, `ncmoe`, `batch`, `nkvo`, `poll`.
+
+**Note:** MTP / speculative decoding is *not* reachable from llama-bench (it has
+no draft/spec support), so it can't be swept here — see the server-benchmark
+roadmap item.
+
 ---
 
 ## Implemented

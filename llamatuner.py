@@ -302,6 +302,7 @@ class Config:
     spec_draft_n_max: int = 2     # --spec-draft-n-max for MTP
     factors: dict = field(default_factory=dict)
     hw: dict = field(default_factory=dict)
+    env_factor_names: set = field(default_factory=set)  # factors that set env vars
 
 
 def build_factors(cfg: Config):
@@ -344,30 +345,59 @@ def generate_runs(factors: dict, array: str | None):
 # ---------------------------------------------------------------------------
 # Command building + execution
 # ---------------------------------------------------------------------------
+# Factor name -> llama-bench flag(s). kv_type applies its value to both -ctk/-ctv.
+# Extend this map to make a new llama-bench parameter sweepable as a factor.
+BENCH_FLAG = {
+    "ngl": ("-ngl",),
+    "threads": ("-t",),
+    "ubatch": ("-ub",),
+    "n_depth": ("-d",),
+    "ncmoe": ("-ncmoe",),
+    "kv_type": ("-ctk", "-ctv"),
+    "batch": ("-b",),
+    "nkvo": ("-nkvo",),
+    "poll": ("--poll",),
+}
+
+
 def bench_command(cfg: Config, f: dict) -> list[str]:
     cmd = [
         str(cfg.llama_bench),
         "-m", str(cfg.model),
-        "-ngl", f["ngl"],
-        "-t", f["threads"],
-        "-ctk", f["kv_type"],
-        "-ctv", f["kv_type"],
-        "-ub", f["ubatch"],
-        "-b", str(FIXED_BATCH),
         "-fa", str(FIXED_FA),
         "-mmp", str(FIXED_MMAP),
-        "-d", f["n_depth"],
         "-p", str(cfg.n_prompt),
         "-n", str(cfg.n_gen),
         "-r", str(cfg.reps),
         "-o", "json",
     ]
-    if "ncmoe" in f:
-        cmd += ["-ncmoe", f["ncmoe"]]
+    ub = int(f.get("ubatch", 512))
+    if "batch" not in f:  # batch fixed unless swept; llama-bench needs -b >= -ub
+        cmd += ["-b", str(max(FIXED_BATCH, ub))]
+    for name, val in f.items():
+        if name in cfg.env_factor_names:
+            continue  # env vars are applied to the process, not the command line
+        flags = BENCH_FLAG.get(name)
+        if not flags:
+            continue
+        if name == "batch":
+            val = str(max(int(val), ub))
+        for fl in flags:
+            cmd += [fl, val]
     return cmd
 
 
+def run_env(cfg: Config, f: dict) -> dict:
+    """Process environment for a run: base env plus any env-factor values."""
+    env = dict(os.environ)
+    for name in cfg.env_factor_names:
+        if name in f:
+            env[name] = f[name]
+    return env
+
+
 def server_command(cfg: Config, f: dict, ctx: int) -> str:
+    batch = f.get("batch", str(FIXED_BATCH))
     parts = [
         "./llama-server",
         f"-m {cfg.model.name}",
@@ -375,18 +405,25 @@ def server_command(cfg: Config, f: dict, ctx: int) -> str:
         f"-t {f['threads']}",
         f"-c {ctx}",
         f"-ctk {f['kv_type']} -ctv {f['kv_type']}",
-        f"-ub {f['ubatch']} -b {FIXED_BATCH}",
+        f"-ub {f['ubatch']} -b {batch}",
         "-fa 1",
     ]
     if "ncmoe" in f:
         parts.append(f"-ncmoe {f['ncmoe']}")
+    if f.get("nkvo") == "1":
+        parts.append("-nkvo")
+    if "poll" in f:
+        parts.append(f"--poll {f['poll']}")
     # Multi-token prediction: if the model ships a NextN/MTP head, enable
     # draft-mtp speculative decoding for extra generation throughput. NOTE: the
     # sweep's measured t/s does NOT include this boost (llama-bench can't do
     # speculative decoding); it's an additional multiplier on top.
     if cfg.emit_mtp and cfg.hw.get("n_nextn", 0) > 0:
         parts.append(f"--spec-type draft-mtp --spec-draft-n-max {cfg.spec_draft_n_max}")
-    return " \\\n    ".join(parts)
+    cmd = " \\\n    ".join(parts)
+    # prepend any winning env-var factor values as an env prefix
+    env_prefix = " ".join(f"{n}={f[n]}" for n in sorted(cfg.env_factor_names) if n in f)
+    return (env_prefix + " \\\n  " + cmd) if env_prefix else cmd
 
 
 _OOM_PAT = re.compile(
@@ -456,7 +493,8 @@ def run_one(cfg: Config, f: dict, timeout: int):
     cmd = bench_command(cfg, f)
     t0 = time.time()
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
+                              env=run_env(cfg, f))
     except subprocess.TimeoutExpired:
         return {"status": "TIMEOUT", "pp_tps": 0.0, "tg_tps": 0.0,
                 "secs": time.time() - t0}
@@ -640,6 +678,19 @@ def selftest() -> bool:
         ]
         depths = sorted(int(r["n_depth"]) for r in pareto_frontier(rows))
         assert depths == [0, 16384], depths
+
+        # command builder: flag map, env split, batch clamp
+        cfg = Config(model=Path("m.gguf"), llama_bench=Path("lb"), array="L25",
+                     ctx_floor=16384, env_factor_names={"GGML_CUDA_FORCE_MMQ"})
+        f = {"ngl": "64", "threads": "8", "kv_type": "q4_0", "ubatch": "2048",
+             "n_depth": "0", "nkvo": "1", "poll": "50", "GGML_CUDA_FORCE_MMQ": "1"}
+        cmd = bench_command(cfg, f)
+        assert "-nkvo" in cmd and "--poll" in cmd
+        assert "-ctk" in cmd and "-ctv" in cmd
+        assert "GGML_CUDA_FORCE_MMQ" not in " ".join(cmd)  # env not on cmdline
+        assert run_env(cfg, f)["GGML_CUDA_FORCE_MMQ"] == "1"
+        cmd2 = bench_command(cfg, {"ubatch": "2048", "batch": "512"})  # clamp b>=ub
+        assert cmd2[cmd2.index("-b") + 1] == "2048"
     except AssertionError as e:
         print(f"selftest FAILED: {e}")
         return False
@@ -659,8 +710,11 @@ def main():
     ap.add_argument("--array", default="L25",
                     help="Taguchi array (L25, L125, ..., or 'auto'); default L25")
     ap.add_argument("--factor", action="append", default=[], metavar="NAME=v1,v2,...",
-                    help="override a factor's levels (repeatable), e.g. "
-                         "--factor ngl=56,60,64 --factor kv_type=f16,q4_0,q8_0")
+                    help="override/add a sweepable factor (repeatable), e.g. "
+                         "--factor ngl=56,60,64 --factor nkvo=0,1 --factor poll=0,50")
+    ap.add_argument("--env", action="append", default=[], metavar="NAME=v1,v2,...",
+                    help="sweep an environment variable as a factor (repeatable), "
+                         "e.g. --env GGML_CUDA_FORCE_MMQ=0,1")
     ap.add_argument("--ctx-floor", type=int, default=16384,
                     help="minimum usable context for the BALANCED pick")
     ap.add_argument("--probe-ctx", action="store_true",
@@ -719,17 +773,27 @@ def main():
     )
     cfg.factors = build_factors(cfg)
 
-    # apply --factor overrides (known factors only)
-    KNOWN = {"ngl", "n_depth", "threads", "kv_type", "ubatch", "ncmoe"}
+    # apply --factor overrides / additions (any name in BENCH_FLAG is sweepable)
     for spec in args.factor:
         name, _, vals = spec.partition("=")
         name = name.strip()
         levels = [v.strip() for v in vals.split(",") if v.strip()]
-        if name not in KNOWN:
-            ap.error(f"--factor: unknown factor '{name}' (known: {sorted(KNOWN)})")
+        if name not in BENCH_FLAG:
+            ap.error(f"--factor: unknown factor '{name}' "
+                     f"(sweepable: {sorted(BENCH_FLAG)})")
         if not levels:
             ap.error(f"--factor {name}: no levels given")
         cfg.factors[name] = levels
+
+    # apply --env: each becomes an orthogonal factor that sets a process env var
+    for spec in args.env:
+        name, _, vals = spec.partition("=")
+        name = name.strip()
+        levels = [v.strip() for v in vals.split(",") if v.strip()]
+        if not name or not levels:
+            ap.error(f"--env expects NAME=v1,v2,... (got '{spec}')")
+        cfg.factors[name] = levels
+        cfg.env_factor_names.add(name)
 
     print("=" * 70)
     print("llamatuner")
