@@ -1,0 +1,47 @@
+<!doctype html><meta charset=utf-8>
+<title>llamatune — Qwen3.6-27B-UD-Q6_K_XL.gguf</title>
+<style>
+:root{color-scheme:light dark}
+body{font:15px/1.5 system-ui,sans-serif;margin:0;padding:24px;max-width:1100px;
+ margin:auto;background:Canvas;color:CanvasText}
+h1{margin:0 0 4px} .meta{color:#888;margin-bottom:20px;font-size:13px}
+.cards{display:flex;gap:14px;flex-wrap:wrap;margin-bottom:26px}
+.card{flex:1;min-width:280px;border:1px solid #8883;border-radius:10px;padding:14px}
+.card h3{margin:0 0 8px;font-size:13px;text-transform:uppercase;letter-spacing:.04em;color:#888}
+.big{font-size:30px;font-weight:700} .unit{font-size:14px;color:#888;font-weight:400}
+.muted{color:#888;font-size:13px}
+pre{background:#8881;padding:10px;border-radius:8px;overflow-x:auto;font-size:12px;margin:10px 0 0}
+h2{margin:26px 0 12px;font-size:16px;border-bottom:1px solid #8883;padding-bottom:6px}
+.fx{margin-bottom:14px} .fxh{display:flex;justify-content:space-between;margin-bottom:4px}
+.lvl{display:flex;align-items:center;gap:8px;margin:2px 0}
+.ll{width:64px;text-align:right;font-size:12px;color:#888}
+.lv{width:56px;font-size:12px;font-variant-numeric:tabular-nums}
+.bar{height:14px;background:linear-gradient(90deg,#4a9,#6cf);border-radius:3px}
+table{border-collapse:collapse;width:100%;font-size:13px}
+th,td{text-align:left;padding:4px 8px;border-bottom:1px solid #8882;font-variant-numeric:tabular-nums}
+th{color:#888;font-weight:600} tr.bad{opacity:.5}
+</style>
+<h1>llamatune report</h1>
+<div class=meta>Qwen3.6-27B-UD-Q6_K_XL.gguf · 65 layers · 8c/16t · 32752 MiB VRAM · profile single · driver server · array L8<br>objective: effective t/s for a single request
+ (512 prompt + 256 gen tokens) — 8/8 configs OK</div>
+<div class=cards><div class=card><h3>Best</h3><div class=big>50.6 <span class=unit>eff t/s</span></div><div class=muted>tg 22.4 · pp 137.8 · depth 0 · ngl 64 · kv f16 · ub 512 · t 8</div><pre>./llama-server \
+    -m Qwen3.6-27B-UD-Q6_K_XL.gguf \
+    -ngl 64 \
+    -t 8 \
+    -c 8192 \
+    -ctk f16 -ctv f16 \
+    -ub 512 -b 2048 \
+    -fa 1 \
+    --spec-type draft-mtp --spec-draft-n-max 3</pre></div><div class=card><h3>Balanced (≥8192)</h3><p class=muted>none met the constraint</p></div><div class=card><h3>Longest context</h3><div class=big>41.4 <span class=unit>eff t/s</span></div><div class=muted>tg 18.1 · pp 117.0 · depth 4096 · ngl 64 · kv f16 · ub 512 · t 8</div><pre>./llama-server \
+    -m Qwen3.6-27B-UD-Q6_K_XL.gguf \
+    -ngl 64 \
+    -t 8 \
+    -c 8192 \
+    -ctk f16 -ctv f16 \
+    -ub 512 -b 2048 \
+    -fa 1 \
+    --spec-type draft-mtp --spec-draft-n-max 3</pre></div></div>
+<h2>What matters (main effects, by impact)</h2><div class=fx><div class=fxh><b>kv_type</b><span class=muted>impact 8.2 (100%)</span></div><div class=lvl><span class=ll>f16</span><span class=bar style='width:100%'></span><span class=lv>37.8</span></div><div class=lvl><span class=ll>q8_0</span><span class=bar style='width:78%'></span><span class=lv>29.6</span></div></div><div class=fx><div class=fxh><b>ubatch</b><span class=muted>impact 7.4 (90%)</span></div><div class=lvl><span class=ll>512</span><span class=bar style='width:100%'></span><span class=lv>37.4</span></div><div class=lvl><span class=ll>1024</span><span class=bar style='width:80%'></span><span class=lv>30.0</span></div></div><div class=fx><div class=fxh><b>n_depth</b><span class=muted>impact 1.2 (15%)</span></div><div class=lvl><span class=ll>0</span><span class=bar style='width:100%'></span><span class=lv>34.3</span></div><div class=lvl><span class=ll>4096</span><span class=bar style='width:96%'></span><span class=lv>33.1</span></div></div>
+<h2>Pareto frontier (context vs effective t/s)</h2>
+<table><tr><th>context</th><th>eff t/s</th><th>tg</th><th>ngl</th><th>kv</th><th>ubatch</th></tr><tr><td>0</td><td>50.6</td><td>22.4</td><td>64</td><td>f16</td><td>512</td></tr><tr><td>4096</td><td>41.4</td><td>18.1</td><td>64</td><td>f16</td><td>512</td></tr></table>
+<h2>All runs</h2><table><tr><th>run</th><th>ngl</th><th>n_depth</th><th>threads</th><th>kv_type</th><th>ubatch</th><th>spec_n_max</th><th>eff</th><th>tg</th><th>pp</th><th>status</th></tr><tr><td>1</td><td>64</td><td>0</td><td>8</td><td>f16</td><td>512</td><td>3</td><td>50.6</td><td>22.4</td><td>137.8</td><td>OK</td></tr><tr><td>3</td><td>64</td><td>4096</td><td>8</td><td>f16</td><td>512</td><td>3</td><td>41.4</td><td>18.1</td><td>117.0</td><td>OK</td></tr><tr><td>7</td><td>64</td><td>4096</td><td>8</td><td>f16</td><td>1024</td><td>3</td><td>30.7</td><td>13.3</td><td>88.1</td><td>OK</td></tr><tr><td>2</td><td>64</td><td>0</td><td>8</td><td>q8_0</td><td>1024</td><td>3</td><td>30.6</td><td>12.9</td><td>96.8</td><td>OK</td></tr><tr><td>4</td><td>64</td><td>4096</td><td>8</td><td>q8_0</td><td>1024</td><td>3</td><td>30.3</td><td>13.0</td><td>89.7</td><td>OK</td></tr><tr><td>8</td><td>64</td><td>4096</td><td>8</td><td>q8_0</td><td>512</td><td>3</td><td>29.8</td><td>12.8</td><td>89.5</td><td>OK</td></tr><tr><td>5</td><td>64</td><td>0</td><td>8</td><td>f16</td><td>1024</td><td>3</td><td>28.3</td><td>12.0</td><td>87.5</td><td>OK</td></tr><tr><td>6</td><td>64</td><td>0</td><td>8</td><td>q8_0</td><td>512</td><td>3</td><td>27.6</td><td>11.6</td><td>88.4</td><td>OK</td></tr></table>

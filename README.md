@@ -144,6 +144,13 @@ Full per-run data is written to `results.csv`.
   main-effects model can misattribute an interaction to a main effect. This is why
   the recommendation is driven off the Pareto, and why we keep the spare column for
   an error estimate.
+- **Beware thermal drift.** GPUs (notably the MI50) throttle under sustained load,
+  so throughput drifts *down* over a long sweep — the same config can measure 40%+
+  slower late in the run than early. To stop that drift from confounding the factor
+  effects, **execution order is randomized by default** (`--seed` to reproduce,
+  `--no-shuffle` to disable). For steadier numbers use `--full` (more reps) and/or
+  `--cooldown` to pause between runs. If `--confirm` reports a large predicted-vs-
+  actual gap, suspect either interactions *or* thermal drift.
 
 ---
 
@@ -209,6 +216,9 @@ python3 llamatuner.py MODEL.gguf [options]
   --results PATH     results CSV output (default: results.csv)
   --resume           skip runs already in --results (rows save incrementally,
                      so an interrupted sweep can be resumed)
+  --no-shuffle       run in array order (default: randomized, see below)
+  --seed N           seed the randomized order (reproducibility)
+  --cooldown SECS    pause between runs so the GPU can cool (thermal drift)
   --llama-cpp PATH   path to llama.cpp (root or build/bin); also $LLAMA_CPP/$PATH
 ```
 

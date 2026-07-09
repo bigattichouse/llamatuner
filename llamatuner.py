@@ -20,6 +20,7 @@ import argparse
 import csv
 import json
 import os
+import random
 import re
 import shutil
 import struct
@@ -1219,6 +1220,14 @@ def main():
                          "saved incrementally, so an interrupted sweep resumes)")
     ap.add_argument("--html", type=Path, default=None,
                     help="also write a visual HTML report (Pareto + main effects)")
+    ap.add_argument("--no-shuffle", action="store_true",
+                    help="run configs in array order (default: randomized to "
+                         "decorrelate thermal/background drift from factors)")
+    ap.add_argument("--seed", type=int, default=None,
+                    help="random seed for execution order (reproducibility)")
+    ap.add_argument("--cooldown", type=float, default=0,
+                    help="seconds to pause between runs so the GPU can cool "
+                         "(reduces thermal-throttling drift; default 0)")
     args = ap.parse_args()
 
     if args.selftest:
@@ -1410,6 +1419,15 @@ def main():
     else:
         plan = [[run] for run in runs]
 
+    # Randomize execution order to decorrelate slow drift (GPU thermal throttling,
+    # background load) from the factors — standard DOE practice. For the server
+    # driver we shuffle whole groups so reuse still holds. --no-shuffle keeps
+    # array order; --seed makes it reproducible.
+    if not args.no_shuffle:
+        seed = args.seed if args.seed is not None else random.randrange(1 << 30)
+        random.Random(seed).shuffle(plan)
+        print(f"execution order: randomized (seed={seed}) to decorrelate drift")
+
     sweep_start = time.time()
     i = 0
     try:
@@ -1461,6 +1479,8 @@ def main():
                           f"pp={res['pp_tps']:.1f}) ({res['secs']:.0f}s)  "
                           f"[{i}/{len(runs)} done, elapsed {fmt_dur(elapsed)}, "
                           f"ETA ~{fmt_dur(eta)}]", flush=True)
+                    if args.cooldown > 0:
+                        time.sleep(args.cooldown)  # let the GPU settle (thermal)
             finally:
                 if session:
                     session.close()
