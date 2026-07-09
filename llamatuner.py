@@ -418,7 +418,7 @@ def run_with_progress(cfg: Config, f: dict, timeout: int, prefix: str):
     """Run one config. On a TTY, show a live elapsed ticker; otherwise print a
     plain start line so redirected logs stay one-line-in/one-line-out."""
     if not sys.stdout.isatty():
-        print(prefix + " ...", flush=True)
+        print("trying " + prefix + " ...", flush=True)
         return run_one(cfg, f, timeout)
 
     stop = threading.Event()
@@ -426,7 +426,7 @@ def run_with_progress(cfg: Config, f: dict, timeout: int, prefix: str):
 
     def tick():
         while not stop.wait(1.0):
-            sys.stdout.write(f"\r{prefix} ... {fmt_dur(time.time() - t0)} "
+            sys.stdout.write(f"\rtrying {prefix} ... {fmt_dur(time.time() - t0)} "
                              f"(timeout {fmt_dur(timeout)})   ")
             sys.stdout.flush()
 
@@ -437,7 +437,7 @@ def run_with_progress(cfg: Config, f: dict, timeout: int, prefix: str):
     finally:
         stop.set()
         th.join(timeout=0.2)
-        sys.stdout.write("\r" + " " * (len(prefix) + 48) + "\r")  # clear line
+        sys.stdout.write("\r" + " " * (len(prefix) + 56) + "\r")  # clear line
         sys.stdout.flush()
 
 
@@ -722,9 +722,11 @@ def main():
     for i, run in enumerate(runs, 1):
         f = run["factors"]
         rid = run.get("run_id", i)
+        nl = cfg.hw.get("n_layers") or "?"
         prefix = (f"[{i}/{len(runs)}] run {rid}: "
-                  f"ngl={f['ngl']} d={f['n_depth']} t={f['threads']} "
-                  f"kv={f['kv_type']} ub={f['ubatch']}")
+                  f"{f['ngl']}/{nl} layers on GPU, {f['threads']} threads, "
+                  f"{f['kv_type']} KV cache, {f['n_depth']}-token context, "
+                  f"ubatch {f['ubatch']}")
         res = run_with_progress(cfg, f, args.timeout, prefix)
         row = {"run_id": rid, **f, **res}
         rows.append(row)
