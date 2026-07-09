@@ -185,14 +185,28 @@ def read_gguf_metadata(path: Path) -> dict:
         return {}
 
 
-def model_block_count(meta: dict) -> int | None:
+def _meta_int(meta: dict, suffix: str) -> int | None:
     for k, v in meta.items():
-        if k.endswith(".block_count"):
+        if k.endswith(suffix):
             try:
                 return int(v)
             except (TypeError, ValueError):
                 return None
     return None
+
+
+def model_block_count(meta: dict) -> int | None:
+    return _meta_int(meta, ".block_count")
+
+
+def model_expert_count(meta: dict) -> int:
+    """Number of MoE experts; 0 (or missing) means a dense model."""
+    return _meta_int(meta, ".expert_count") or 0
+
+
+def model_context_length(meta: dict) -> int | None:
+    """Native max context the model was trained for."""
+    return _meta_int(meta, ".context_length")
 
 
 # ---------------------------------------------------------------------------
@@ -250,6 +264,11 @@ DEFAULT_KV_LEVELS = ["f16", "q8_0", "q5_1", "q4_1", "q4_0"]
 DEFAULT_UBATCH_LEVELS = [128, 256, 512, 1024, 2048]
 
 
+def ncmoe_levels(n_layers: int | None) -> list[int]:
+    """Levels for -ncmoe (how many layers keep their MoE experts on CPU)."""
+    return five_levels_span(0, n_layers if n_layers else 64)
+
+
 @dataclass
 class Config:
     model: Path
@@ -264,13 +283,19 @@ def build_factors(cfg: Config):
     phys = cfg.hw["phys"]
     logical = cfg.hw["logical"]
     n_layers = cfg.hw.get("n_layers")
-    return {
+    factors = {
         "ngl": [str(x) for x in ngl_levels(n_layers)],
         "n_depth": [str(x) for x in DEFAULT_DEPTH_LEVELS],
         "threads": [str(x) for x in thread_levels(phys, logical)],
         "kv_type": list(DEFAULT_KV_LEVELS),
         "ubatch": [str(x) for x in DEFAULT_UBATCH_LEVELS],
     }
+    # For MoE models, expert CPU-offload (-ncmoe) is the biggest RAM/VRAM lever,
+    # so promote it to a swept factor (uses L25's 6th column). For dense models
+    # it would be inert, so we leave that column spare for error estimation.
+    if cfg.hw.get("n_experts", 0) > 0:
+        factors["ncmoe"] = [str(x) for x in ncmoe_levels(n_layers)]
+    return factors
 
 
 # ---------------------------------------------------------------------------
@@ -298,7 +323,7 @@ def generate_runs(factors: dict, array: str | None):
 # Command building + execution
 # ---------------------------------------------------------------------------
 def bench_command(cfg: Config, f: dict) -> list[str]:
-    return [
+    cmd = [
         str(cfg.llama_bench),
         "-m", str(cfg.model),
         "-ngl", f["ngl"],
@@ -315,6 +340,9 @@ def bench_command(cfg: Config, f: dict) -> list[str]:
         "-r", str(BENCH_REPS),
         "-o", "json",
     ]
+    if "ncmoe" in f:
+        cmd += ["-ncmoe", f["ncmoe"]]
+    return cmd
 
 
 def server_command(cfg: Config, f: dict, ctx: int) -> str:
@@ -328,6 +356,8 @@ def server_command(cfg: Config, f: dict, ctx: int) -> str:
         f"-ub {f['ubatch']} -b {FIXED_BATCH}",
         "-fa 1",
     ]
+    if "ncmoe" in f:
+        parts.append(f"-ncmoe {f['ncmoe']}")
     return " \\\n    ".join(parts)
 
 
@@ -462,29 +492,117 @@ def taguchi_effects(exp, rows: list[dict]):
 
 
 # ---------------------------------------------------------------------------
+# Stage-2: max-context probe
+# ---------------------------------------------------------------------------
+def probe_max_context(cfg: Config, base_f: dict, timeout: int, cap: int):
+    """Binary-search the largest n_depth that loads (no OOM) for base_f.
+
+    Returns (max_depth, tg_tps_at_max) or None if even depth 0 fails.
+    """
+    def try_depth(d):
+        f = dict(base_f)
+        f["n_depth"] = str(d)
+        r = run_one(cfg, f, timeout)
+        return r["status"] == "OK", r
+
+    good, _ = try_depth(0)
+    if not good:
+        return None
+    good, r = try_depth(cap)
+    if good:
+        return cap, r["tg_tps"]
+
+    lo, hi, best_tps = 0, cap, None
+    while hi - lo > 2048:
+        mid = ((lo + hi) // 2 // 1024) * 1024
+        if mid <= lo:
+            break
+        good, r = try_depth(mid)
+        if good:
+            lo, best_tps = mid, r["tg_tps"]
+        else:
+            hi = mid
+    return lo, best_tps
+
+
+# ---------------------------------------------------------------------------
+# Offline self-test (no GPU): exercises parsing / analysis / factor logic
+# ---------------------------------------------------------------------------
+def selftest() -> bool:
+    try:
+        # llama-bench JSON parsing (schema per llama-bench.cpp get_fields())
+        sample = json.dumps([
+            {"n_prompt": 512, "n_gen": 0, "n_depth": 0, "avg_ts": 123.4},
+            {"n_prompt": 0, "n_gen": 128, "n_depth": 0, "avg_ts": 45.6},
+        ])
+        assert parse_bench_json(sample) == (123.4, 45.6)
+        assert parse_bench_json("not json") == (None, None)
+
+        # OOM detection
+        assert _OOM_PAT.search("ggml_backend_alloc failed: out of memory")
+        assert _OOM_PAT.search("ROCm error: hipErrorOutOfMemory")
+
+        # factor-level generation
+        assert five_levels_span(0, 64) == [0, 16, 32, 48, 64]
+        assert ngl_levels(64)[0] == 0 and ngl_levels(64)[-1] == 64
+        assert len(thread_levels(8, 16)) >= 3
+
+        # MoE metadata
+        assert model_expert_count({"llama.expert_count": 8}) == 8
+        assert model_expert_count({}) == 0
+
+        # Pareto frontier (maximize depth and tg_tps)
+        rows = [
+            {"status": "OK", "n_depth": "0", "tg_tps": 50.0},
+            {"status": "OK", "n_depth": "16384", "tg_tps": 40.0},
+            {"status": "OK", "n_depth": "16384", "tg_tps": 30.0},  # dominated
+            {"status": "OK", "n_depth": "4096", "tg_tps": 20.0},   # dominated
+            {"status": "OOM", "n_depth": "65536", "tg_tps": 0.0},  # excluded
+        ]
+        depths = sorted(int(r["n_depth"]) for r in pareto_frontier(rows))
+        assert depths == [0, 16384], depths
+    except AssertionError as e:
+        print(f"selftest FAILED: {e}")
+        return False
+    print("selftest: all checks passed")
+    return True
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("model", type=Path, help="path to the GGUF model")
+    ap.add_argument("model", type=Path, nargs="?", help="path to the GGUF model")
     ap.add_argument("--run", action="store_true",
                     help="actually execute the benchmark sweep (uses the GPU)")
     ap.add_argument("--array", default="L25",
                     help="Taguchi array (L25, L125, ...); default L25")
     ap.add_argument("--ctx-floor", type=int, default=16384,
                     help="minimum usable context for the BALANCED pick")
+    ap.add_argument("--probe-ctx", action="store_true",
+                    help="after the sweep, binary-search the max context that "
+                         "loads for the fastest config (needs --run)")
+    ap.add_argument("--selftest", action="store_true",
+                    help="run offline logic checks and exit (no GPU, no model)")
     ap.add_argument("--llama-bench", type=Path, default=DEFAULT_LLAMA_BENCH)
     ap.add_argument("--timeout", type=int, default=1200,
                     help="per-run timeout in seconds")
     ap.add_argument("--results", type=Path, default=Path("results.csv"))
     args = ap.parse_args()
 
+    if args.selftest:
+        sys.exit(0 if selftest() else 1)
+    if not args.model:
+        ap.error("model path is required (or use --selftest)")
     if not args.model.exists():
         ap.error(f"model not found: {args.model}")
 
     meta = read_gguf_metadata(args.model)
     n_layers = model_block_count(meta)
+    n_experts = model_expert_count(meta)
+    n_ctx_train = model_context_length(meta)
     phys = detect_physical_cores()
     logical = detect_logical_cores()
     vram = detect_vram_mib()
@@ -494,7 +612,8 @@ def main():
         llama_bench=args.llama_bench,
         array=args.array,
         ctx_floor=args.ctx_floor,
-        hw={"phys": phys, "logical": logical, "n_layers": n_layers, "vram": vram},
+        hw={"phys": phys, "logical": logical, "n_layers": n_layers, "vram": vram,
+            "n_experts": n_experts, "n_ctx_train": n_ctx_train},
     )
     cfg.factors = build_factors(cfg)
 
@@ -503,9 +622,12 @@ def main():
     print("=" * 70)
     print(f"model      : {cfg.model.name}")
     arch = meta.get("general.architecture", "?")
-    print(f"arch       : {arch}   layers: {n_layers if n_layers else '?'}")
+    moe = f"MoE ({n_experts} experts)" if n_experts else "dense"
+    print(f"arch       : {arch}   layers: {n_layers if n_layers else '?'}   {moe}")
     print(f"CPU        : {phys} physical / {logical} logical cores")
     print(f"VRAM       : {vram} MiB" if vram else "VRAM       : (undetected)")
+    if n_ctx_train:
+        print(f"native ctx : {n_ctx_train}")
     print(f"array      : {cfg.array}   ctx floor: {cfg.ctx_floor}")
     print("\nfactors (5 levels each):")
     for name, levels in cfg.factors.items():
@@ -541,10 +663,10 @@ def main():
         print(f"{res['status']} tg={res['tg_tps']:.1f} t/s "
               f"pp={res['pp_tps']:.1f} ({res['secs']:.0f}s)")
 
-    # persist
+    # persist (columns follow the actual factor set, incl. ncmoe when MoE)
     with open(args.results, "w", newline="") as fh:
-        cols = ["run_id", "ngl", "n_depth", "threads", "kv_type", "ubatch",
-                "pp_tps", "tg_tps", "status", "secs"]
+        cols = (["run_id"] + list(cfg.factors.keys())
+                + ["pp_tps", "tg_tps", "status", "secs"])
         w = csv.DictWriter(fh, fieldnames=cols, extrasaction="ignore")
         w.writeheader()
         w.writerows(rows)
@@ -552,6 +674,21 @@ def main():
 
     report(cfg, rows)
     taguchi_effects(exp, rows)
+
+    if args.probe_ctx:
+        ok = [r for r in rows if r["status"] == "OK"]
+        if ok:
+            fastest = max(ok, key=lambda r: r["tg_tps"])
+            cap = cfg.hw.get("n_ctx_train") or 131072
+            print(f"\n### Max-context probe (fastest config, cap={cap})")
+            base = {k: fastest[k] for k in cfg.factors}
+            res = probe_max_context(cfg, base, args.timeout, cap)
+            if res:
+                depth, tps = res
+                print(f"  largest context that loads: ~{depth} tokens"
+                      + (f"  (tg={tps:.1f} t/s there)" if tps else ""))
+            else:
+                print("  even depth 0 failed to load — check the config")
 
 
 if __name__ == "__main__":

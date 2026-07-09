@@ -160,25 +160,36 @@ python3 llamatuner.py MODEL.gguf [options]
   --run              actually execute the sweep (default: plan/dry-run, no GPU)
   --array L25|L125   Taguchi array (default: L25)
   --ctx-floor N      minimum usable context for the BALANCED pick (default: 16384)
+  --probe-ctx        after the sweep, binary-search the largest context that
+                     loads for the fastest config (needs --run)
+  --selftest         run offline logic checks and exit (no GPU, no model)
   --llama-bench PATH path to the llama-bench binary
   --timeout SECS     per-run timeout (default: 1200)
   --results PATH     results CSV output (default: results.csv)
 ```
 
+Run `python3 llamatuner.py --selftest` to verify the JSON parser, OOM detection,
+factor-level generation, MoE detection, and Pareto logic without a GPU or model.
+
 ---
+
+## Implemented
+
+- **MoE awareness** — detects `<arch>.expert_count` in GGUF metadata; if the model is
+  MoE, promotes `-ncmoe` (CPU-offload of experts) to a swept factor (the biggest
+  RAM/VRAM lever on MoE). If dense, keeps the spare L25 column for error estimation.
+- **Max-context probe** (`--probe-ctx`) — after the sweep, binary-searches the largest
+  context that loads for the fastest config, capped at the model's native context.
+- **Offline self-test** (`--selftest`) — verifies the core logic without a GPU.
 
 ## Roadmap / ideas
 
-- **MoE awareness** — detect `<arch>.expert_count` in GGUF metadata; if the model is
-  MoE, promote `-ncmoe` (CPU-offload of experts) to a swept factor (it's the biggest
-  RAM/VRAM lever on MoE). If dense, keep the spare column for error estimation.
 - **Flash-attn as an outer block** — run the array twice (`-fa 0` / `-fa 1`) to
   quantify flash-attention's effect directly, mindful that quantized KV requires
   `-fa 1`.
-- **Max-context probe** — use llama-bench's `--fit-target` / `--fit-ctx` to
-  binary-search the largest context that loads for the best-throughput config.
-- **Morris/Sobol sensitivity** — if L25's spare-column error estimate shows the
-  additive model is untrustworthy, fall back to a sensitivity screen that accounts
-  for interactions.
+- **Morris/Sobol pre-screen** — the vendored `robust` suite ships `morris` and `sobol`
+  binaries. Use Morris to screen which factors matter (μ\* importance, σ interaction
+  flag) before committing to the full Taguchi bench, and Sobol for variance/interaction
+  attribution when L25's error estimate says the additive model is shaky.
 
-See [`docs/`](docs/) for the original design notes this project grew from.
+See [`docs/DESIGN.md`](docs/DESIGN.md) for the background and tuning hypotheses.
