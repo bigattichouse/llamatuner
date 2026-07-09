@@ -875,13 +875,135 @@ def report(cfg: Config, rows: list[dict]):
               f"kv={r['kv_type']:>4}  ub={r['ubatch']:>4}")
 
 
+def factor_level_means(rows: list[dict], factor: str) -> dict:
+    """Mean objective score per level of a factor (OK runs only) — the Taguchi
+    main effect for a balanced design."""
+    ok = [r for r in rows if r["status"] == "OK"]
+    means = {}
+    levels = sorted(set(str(r[factor]) for r in ok if factor in r),
+                    key=lambda x: (len(x), x))
+    for lvl in levels:
+        vals = [score_of(r) for r in ok if str(r.get(factor)) == lvl]
+        if vals:
+            means[lvl] = sum(vals) / len(vals)
+    return means
+
+
+def write_html_report(cfg: Config, rows: list[dict], path: Path):
+    import html as _html
+
+    def esc(x):
+        return _html.escape(str(x))
+
+    ok = [r for r in rows if r["status"] == "OK"]
+    best = max(ok, key=score_of) if ok else None
+    usable = [r for r in ok if int(r["n_depth"]) >= cfg.ctx_floor]
+    balanced = max(usable, key=score_of) if usable else None
+    longest = max(ok, key=lambda r: (int(r["n_depth"]), score_of(r))) if ok else None
+    pareto = pareto_frontier(rows)
+
+    def ctx_for(r):
+        need = max(int(r["n_depth"]) + cfg.n_prompt + cfg.n_gen, cfg.ctx_floor, 4096)
+        return 1 << (need - 1).bit_length()
+
+    def card(title, r):
+        if not r:
+            return f"<div class=card><h3>{esc(title)}</h3><p class=muted>none met the constraint</p></div>"
+        cmd = esc(server_command(cfg, r, ctx_for(r)))
+        return (f"<div class=card><h3>{esc(title)}</h3>"
+                f"<div class=big>{score_of(r):.1f} <span class=unit>eff t/s</span></div>"
+                f"<div class=muted>tg {r['tg_tps']:.1f} · pp {r['pp_tps']:.1f} · "
+                f"depth {esc(r['n_depth'])} · ngl {esc(r['ngl'])} · kv {esc(r['kv_type'])} · "
+                f"ub {esc(r['ubatch'])} · t {esc(r['threads'])}</div>"
+                f"<pre>{cmd}</pre></div>")
+
+    # main-effects bars, factors ordered by range (impact) descending
+    effects = []
+    for name in cfg.factors:
+        means = factor_level_means(rows, name)
+        if len(means) >= 2:
+            effects.append((max(means.values()) - min(means.values()), name, means))
+    effects.sort(reverse=True)
+    gmax = max((rng for rng, _, _ in effects), default=1) or 1
+    fx_html = []
+    for rng, name, means in effects:
+        vmax = max(means.values()) or 1
+        bars = "".join(
+            f"<div class=lvl><span class=ll>{esc(l)}</span>"
+            f"<span class=bar style='width:{max(2, v / vmax * 100):.0f}%'></span>"
+            f"<span class=lv>{v:.1f}</span></div>"
+            for l, v in means.items())
+        impact = rng / gmax * 100
+        fx_html.append(
+            f"<div class=fx><div class=fxh><b>{esc(name)}</b>"
+            f"<span class=muted>impact {rng:.1f} ({impact:.0f}%)</span></div>{bars}</div>")
+
+    # pareto table
+    par_rows = "".join(
+        f"<tr><td>{int(r['n_depth'])}</td><td>{score_of(r):.1f}</td>"
+        f"<td>{r['tg_tps']:.1f}</td><td>{esc(r['ngl'])}</td><td>{esc(r['kv_type'])}</td>"
+        f"<td>{esc(r['ubatch'])}</td></tr>" for r in pareto)
+
+    # all-runs table
+    fcols = list(cfg.factors.keys())
+    head = "".join(f"<th>{esc(c)}</th>" for c in
+                   ["run", *fcols, "eff", "tg", "pp", "status"])
+    body = ""
+    for r in sorted(rows, key=lambda r: score_of(r), reverse=True):
+        cells = "".join(f"<td>{esc(r.get(c, ''))}</td>" for c in fcols)
+        cls = "" if r["status"] == "OK" else " class=bad"
+        body += (f"<tr{cls}><td>{esc(r.get('run_id',''))}</td>{cells}"
+                 f"<td>{score_of(r):.1f}</td><td>{float(r['tg_tps']):.1f}</td>"
+                 f"<td>{float(r['pp_tps']):.1f}</td><td>{esc(r['status'])}</td></tr>")
+
+    meta = (f"{esc(cfg.model.name)} · {cfg.hw.get('n_layers','?')} layers · "
+            f"{cfg.hw.get('phys')}c/{cfg.hw.get('logical')}t · "
+            f"{cfg.hw.get('vram','?')} MiB VRAM · profile {esc(cfg.profile)} · "
+            f"driver {esc(cfg.driver)} · array {esc(cfg.array)}")
+    doc = f"""<!doctype html><meta charset=utf-8>
+<title>llamatune — {esc(cfg.model.name)}</title>
+<style>
+:root{{color-scheme:light dark}}
+body{{font:15px/1.5 system-ui,sans-serif;margin:0;padding:24px;max-width:1100px;
+ margin:auto;background:Canvas;color:CanvasText}}
+h1{{margin:0 0 4px}} .meta{{color:#888;margin-bottom:20px;font-size:13px}}
+.cards{{display:flex;gap:14px;flex-wrap:wrap;margin-bottom:26px}}
+.card{{flex:1;min-width:280px;border:1px solid #8883;border-radius:10px;padding:14px}}
+.card h3{{margin:0 0 8px;font-size:13px;text-transform:uppercase;letter-spacing:.04em;color:#888}}
+.big{{font-size:30px;font-weight:700}} .unit{{font-size:14px;color:#888;font-weight:400}}
+.muted{{color:#888;font-size:13px}}
+pre{{background:#8881;padding:10px;border-radius:8px;overflow-x:auto;font-size:12px;margin:10px 0 0}}
+h2{{margin:26px 0 12px;font-size:16px;border-bottom:1px solid #8883;padding-bottom:6px}}
+.fx{{margin-bottom:14px}} .fxh{{display:flex;justify-content:space-between;margin-bottom:4px}}
+.lvl{{display:flex;align-items:center;gap:8px;margin:2px 0}}
+.ll{{width:64px;text-align:right;font-size:12px;color:#888}}
+.lv{{width:56px;font-size:12px;font-variant-numeric:tabular-nums}}
+.bar{{height:14px;background:linear-gradient(90deg,#4a9,#6cf);border-radius:3px}}
+table{{border-collapse:collapse;width:100%;font-size:13px}}
+th,td{{text-align:left;padding:4px 8px;border-bottom:1px solid #8882;font-variant-numeric:tabular-nums}}
+th{{color:#888;font-weight:600}} tr.bad{{opacity:.5}}
+</style>
+<h1>llamatune report</h1>
+<div class=meta>{meta}<br>objective: effective t/s for a {esc(cfg.profile)} request
+ ({cfg.n_prompt} prompt + {cfg.n_gen} gen tokens) — {len(ok)}/{len(rows)} configs OK</div>
+<div class=cards>{card('Best', best)}{card(f'Balanced (≥{cfg.ctx_floor})', balanced)}{card('Longest context', longest)}</div>
+<h2>What matters (main effects, by impact)</h2>{''.join(fx_html)}
+<h2>Pareto frontier (context vs effective t/s)</h2>
+<table><tr><th>context</th><th>eff t/s</th><th>tg</th><th>ngl</th><th>kv</th><th>ubatch</th></tr>{par_rows}</table>
+<h2>All runs</h2><table><tr>{head}</tr>{body}</table>
+"""
+    path.write_text(doc)
+    print(f"\nwrote HTML report: {path}")
+
+
 def taguchi_effects(exp, rows: list[dict]):
-    """Main-effects on tg_tps (higher is better)."""
+    """Main-effects on the objective. Returns (optimal_levels, predicted_score)
+    or (None, None)."""
     try:
         from taguchi import Analyzer
     except Exception:
-        return
-    # Feed EVERY run: failed configs (OOM/TIMEOUT/ERROR) carry tg_tps=0.0 as a
+        return None, None
+    # Feed EVERY run: failed configs (OOM/TIMEOUT/ERROR) carry a 0 score as a
     # penalty. The analyzer requires a complete design, and scoring failures as 0
     # is the intended "failure is data" behaviour. (Caveat: a 0 from a timeout is
     # a censored value, so trust the Pareto for the pick and use main-effects only
@@ -890,7 +1012,7 @@ def taguchi_effects(exp, rows: list[dict]):
     n_failed = sum(1 for r in rows if r["status"] != "OK")
     if len(results) < 3:
         print("\n(not enough runs for main-effects analysis)")
-        return
+        return None, None
     try:
         with Analyzer(exp, metric_name="eff_tps") as an:
             an.add_results_from_dict(results)
@@ -900,8 +1022,20 @@ def taguchi_effects(exp, rows: list[dict]):
             print(an.summary())
             opt = an.recommend_optimal(higher_is_better=True)
             print("Predicted-optimal levels:", opt)
+            predicted = None
+            try:
+                p = an.predict_response(opt)
+                if isinstance(p, (int, float)):
+                    predicted = float(p)
+                elif isinstance(p, dict):
+                    nums = [v for v in p.values() if isinstance(v, (int, float))]
+                    predicted = float(nums[0]) if nums else None
+            except Exception:
+                pass
+            return opt, predicted
     except Exception as e:
         print(f"\n(main-effects analysis skipped: {e})")
+        return None, None
 
 
 # ---------------------------------------------------------------------------
@@ -1057,6 +1191,9 @@ def main():
     ap.add_argument("--probe-ctx", action="store_true",
                     help="after the sweep, binary-search the max context that "
                          "loads for the fastest config (needs --run)")
+    ap.add_argument("--confirm", action="store_true",
+                    help="after the sweep, run the predicted-optimal config to "
+                         "verify the model's prediction (implied by --full)")
     ap.add_argument("--selftest", action="store_true",
                     help="run offline logic checks and exit (no GPU, no model)")
     ap.add_argument("--reps", type=int, default=None,
@@ -1080,6 +1217,8 @@ def main():
     ap.add_argument("--resume", action="store_true",
                     help="skip configs already present in --results (rows are "
                          "saved incrementally, so an interrupted sweep resumes)")
+    ap.add_argument("--html", type=Path, default=None,
+                    help="also write a visual HTML report (Pareto + main effects)")
     args = ap.parse_args()
 
     if args.selftest:
@@ -1330,7 +1469,30 @@ def main():
     print(f"\nwrote {args.results}")
 
     report(cfg, rows)
-    taguchi_effects(exp, rows)
+    opt, predicted = taguchi_effects(exp, rows)
+
+    if args.html:
+        write_html_report(cfg, rows, args.html)
+
+    if (args.confirm or args.full) and opt:
+        # Run the predicted-optimal config directly to check the additive model
+        # (Taguchi best practice). A big predicted-vs-actual gap => interactions.
+        f = {k: cfg.factors[k][0] for k in cfg.factors}
+        f.update({k: str(v) for k, v in opt.items() if k in cfg.factors})
+        print("\n### Confirmation run (predicted-optimal config)")
+        prefix = "confirm: " + " ".join(f"{k}={f[k]}" for k in cfg.factors)
+        res = with_ticker(prefix, args.timeout,
+                          lambda: drive_one(cfg, f, args.timeout))
+        actual = effective_tps(cfg.n_prompt, cfg.n_gen, res["pp_tps"], res["tg_tps"])
+        print(f"  predicted eff: "
+              + (f"{predicted:.1f} t/s" if predicted else "(n/a)"))
+        print(f"  measured  eff: {actual:.1f} t/s  (tg={res['tg_tps']:.1f} "
+              f"pp={res['pp_tps']:.1f}, status={res['status']})")
+        if predicted and actual > 0:
+            err = abs(actual - predicted) / predicted * 100
+            verdict = ("additive model holds — trust the prediction" if err <= 15
+                       else "LARGE gap: interactions likely — trust the Pareto pick")
+            print(f"  prediction error: {err:.0f}%  → {verdict}")
 
     if args.probe_ctx:
         ok = [r for r in rows if r["status"] == "OK"]

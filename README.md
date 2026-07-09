@@ -152,8 +152,10 @@ Full per-run data is written to `results.csv`.
 1. **Screen** with **L25** (25 runs, ~30–40 min) to see which knobs dominate and get
    a candidate optimum.
 2. **Refine** the 2–3 dominant factors with **L125** and map the context Pareto finely.
-3. **Confirm** the predicted-optimal config with a direct `llama-server` run at your
-   real context size (standard Taguchi discipline — verifies additivity held).
+3. **Confirm** with `--confirm` (or `--full`): the tool runs the predicted-optimal
+   config directly and reports predicted-vs-actual — a small gap means the additive
+   model held; a large gap means interactions dominate (trust the Pareto pick).
+   Add `--html report.html` for a visual Pareto + main-effects report.
 
 ---
 
@@ -192,6 +194,9 @@ python3 llamatuner.py MODEL.gguf [options]
   --ctx-floor N      minimum usable context for BALANCED (default: from profile)
   --probe-ctx        after the sweep, binary-search the largest context that
                      loads for the fastest config (needs --run)
+  --confirm          run the predicted-optimal config to verify the additive
+                     model (predicted vs actual; implied by --full)
+  --html PATH        also write a visual HTML report (Pareto + main effects)
   --selftest         run offline logic checks and exit (no GPU, no model)
   --reps N           llama-bench repetitions per config (default: 3)
   --n-prompt N       prompt tokens per measurement (default: 512)
