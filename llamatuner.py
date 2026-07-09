@@ -259,9 +259,20 @@ def ngl_levels(n_layers: int | None) -> list[int]:
     return lv
 
 
-DEFAULT_DEPTH_LEVELS = [0, 4096, 16384, 32768, 65536]
+# Don't probe deeper than this by default, even if the model's native context is
+# larger — deep contexts on CPU (low -ngl) prefill very slowly and burn memory.
+DEFAULT_MAX_DEPTH = 65536
 DEFAULT_KV_LEVELS = ["f16", "q8_0", "q5_1", "q4_1", "q4_0"]
 DEFAULT_UBATCH_LEVELS = [128, 256, 512, 1024, 2048]
+
+
+def depth_levels(n_ctx_train: int | None, override_max: int | None = None) -> list[int]:
+    """Five n_depth levels spanning 0..min(native ctx, cap). Adaptive so we
+    never test beyond the model's native context."""
+    top = min(n_ctx_train or DEFAULT_MAX_DEPTH, DEFAULT_MAX_DEPTH)
+    if override_max is not None:
+        top = min(top, override_max)
+    return five_levels_span(0, top)
 
 
 def ncmoe_levels(n_layers: int | None) -> list[int]:
@@ -275,6 +286,10 @@ class Config:
     llama_bench: Path
     array: str
     ctx_floor: int
+    reps: int = BENCH_REPS
+    n_prompt: int = BENCH_N_PROMPT
+    n_gen: int = BENCH_N_GEN
+    max_depth: int | None = None  # cap n_depth levels (memory/time budget)
     factors: dict = field(default_factory=dict)
     hw: dict = field(default_factory=dict)
 
@@ -283,9 +298,10 @@ def build_factors(cfg: Config):
     phys = cfg.hw["phys"]
     logical = cfg.hw["logical"]
     n_layers = cfg.hw.get("n_layers")
+    depths = depth_levels(cfg.hw.get("n_ctx_train"), cfg.max_depth)
     factors = {
         "ngl": [str(x) for x in ngl_levels(n_layers)],
-        "n_depth": [str(x) for x in DEFAULT_DEPTH_LEVELS],
+        "n_depth": [str(x) for x in depths],
         "threads": [str(x) for x in thread_levels(phys, logical)],
         "kv_type": list(DEFAULT_KV_LEVELS),
         "ubatch": [str(x) for x in DEFAULT_UBATCH_LEVELS],
@@ -335,9 +351,9 @@ def bench_command(cfg: Config, f: dict) -> list[str]:
         "-fa", str(FIXED_FA),
         "-mmp", str(FIXED_MMAP),
         "-d", f["n_depth"],
-        "-p", str(BENCH_N_PROMPT),
-        "-n", str(BENCH_N_GEN),
-        "-r", str(BENCH_REPS),
+        "-p", str(cfg.n_prompt),
+        "-n", str(cfg.n_gen),
+        "-r", str(cfg.reps),
         "-o", "json",
     ]
     if "ncmoe" in f:
@@ -454,9 +470,11 @@ def report(cfg: Config, rows: list[dict]):
         print(f"  tg={r['tg_tps']:.1f} t/s  pp={r['pp_tps']:.1f} t/s  "
               f"depth={r['n_depth']}  ngl={r['ngl']}  t={r['threads']}  "
               f"kv={r['kv_type']}  ub={r['ubatch']}")
-        ctx = max(int(r["n_depth"]) + BENCH_N_PROMPT + BENCH_N_GEN, cfg.ctx_floor)
-        # round up to a tidy context size
-        ctx = 1 << (max(int(r["n_depth"]), 4096)).bit_length()
+        # size context to cover the measured depth + a floor, rounded up to a
+        # tidy power of two
+        need = max(int(r["n_depth"]) + cfg.n_prompt + cfg.n_gen,
+                   cfg.ctx_floor, 4096)
+        ctx = 1 << (need - 1).bit_length()
         print("  suggested llama-server command:")
         print("    " + server_command(cfg, r, ctx))
 
@@ -586,6 +604,14 @@ def main():
                          "loads for the fastest config (needs --run)")
     ap.add_argument("--selftest", action="store_true",
                     help="run offline logic checks and exit (no GPU, no model)")
+    ap.add_argument("--reps", type=int, default=BENCH_REPS,
+                    help=f"llama-bench repetitions per config (default {BENCH_REPS})")
+    ap.add_argument("--n-prompt", type=int, default=BENCH_N_PROMPT,
+                    help=f"prompt tokens per measurement (default {BENCH_N_PROMPT})")
+    ap.add_argument("--n-gen", type=int, default=BENCH_N_GEN,
+                    help=f"generated tokens per measurement (default {BENCH_N_GEN})")
+    ap.add_argument("--max-depth", type=int, default=None,
+                    help="cap n_depth factor levels (memory/time budget)")
     ap.add_argument("--llama-bench", type=Path, default=DEFAULT_LLAMA_BENCH)
     ap.add_argument("--timeout", type=int, default=1200,
                     help="per-run timeout in seconds")
@@ -612,6 +638,10 @@ def main():
         llama_bench=args.llama_bench,
         array=args.array,
         ctx_floor=args.ctx_floor,
+        reps=args.reps,
+        n_prompt=args.n_prompt,
+        n_gen=args.n_gen,
+        max_depth=args.max_depth,
         hw={"phys": phys, "logical": logical, "n_layers": n_layers, "vram": vram,
             "n_experts": n_experts, "n_ctx_train": n_ctx_train},
     )
@@ -629,11 +659,11 @@ def main():
     if n_ctx_train:
         print(f"native ctx : {n_ctx_train}")
     print(f"array      : {cfg.array}   ctx floor: {cfg.ctx_floor}")
-    print("\nfactors (5 levels each):")
+    print("\nfactors:")
     for name, levels in cfg.factors.items():
         print(f"  {name:10s}: {', '.join(levels)}")
     print(f"fixed      : -fa {FIXED_FA}  -mmp {FIXED_MMAP}  -b {FIXED_BATCH}  "
-          f"(-p {BENCH_N_PROMPT} -n {BENCH_N_GEN} -r {BENCH_REPS})")
+          f"(-p {cfg.n_prompt} -n {cfg.n_gen} -r {cfg.reps})")
 
     exp, runs = generate_runs(cfg.factors, cfg.array)
     print(f"\ngenerated {len(runs)} runs "

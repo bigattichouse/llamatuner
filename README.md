@@ -45,7 +45,7 @@ Five factors, five levels each (auto-scaled to your hardware and model):
 | Factor        | llama-bench flag | Levels (example, Qwen3.6-27B on MI50) | Notes |
 |---------------|------------------|----------------------------------------|-------|
 | GPU layers    | `-ngl`           | `0, 16, 32, 48, 64`                    | biggest lever; top = model's real layer count |
-| Context depth | `-d` (n-depth)   | `0, 4096, 16384, 32768, 65536`         | KV pre-fill; the speed-vs-context axis |
+| Context depth | `-d` (n-depth)   | 5 levels `0..min(native ctx, 65536)`   | KV pre-fill; the speed-vs-context axis, adaptive to the model's native context |
 | CPU threads   | `-t`             | `4, 6, 8, 12, 16`                      | auto-derived around the physical-core count |
 | KV cache type | `-ctk`/`-ctv`    | `f16, q8_0, q5_1, q4_1, q4_0`          | quantizing the KV cache buys context |
 | Micro-batch   | `-ub`            | `128, 256, 512, 1024, 2048`            | prefill/decode balance |
@@ -163,10 +163,20 @@ python3 llamatuner.py MODEL.gguf [options]
   --probe-ctx        after the sweep, binary-search the largest context that
                      loads for the fastest config (needs --run)
   --selftest         run offline logic checks and exit (no GPU, no model)
+  --reps N           llama-bench repetitions per config (default: 3)
+  --n-prompt N       prompt tokens per measurement (default: 512)
+  --n-gen N          generated tokens per measurement (default: 128)
+  --max-depth N      cap the n_depth factor levels (memory/time budget)
   --llama-bench PATH path to the llama-bench binary
   --timeout SECS     per-run timeout (default: 1200)
   --results PATH     results CSV output (default: results.csv)
 ```
+
+> **Note on run time.** Deep-context configs at low `-ngl` prefill their KV cache
+> on the CPU, which is slow (tens of seconds to minutes per run on a big model).
+> That cost is inherent to measuring throughput *at* context. Use `--reps`,
+> `--n-prompt/--n-gen`, and `--max-depth` to trade accuracy/coverage for speed on
+> a first pass.
 
 Run `python3 llamatuner.py --selftest` to verify the JSON parser, OOM detection,
 factor-level generation, MoE detection, and Pareto logic without a GPU or model.
