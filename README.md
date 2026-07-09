@@ -18,8 +18,9 @@ python3 llamatuner.py /path/to/model.gguf
 # actually run the sweep (uses the GPU)
 python3 llamatuner.py /path/to/model.gguf --run
 
-# bigger, finer sweep
-python3 llamatuner.py /path/to/model.gguf --run --array L125
+# fast screen (1 rep) vs thorough (5 reps); the array is auto-chosen
+python3 llamatuner.py /path/to/model.gguf --run --quick
+python3 llamatuner.py /path/to/model.gguf --run --full
 ```
 
 ---
@@ -181,10 +182,13 @@ python3 llamatuner.py MODEL.gguf [options]
 
   --run              actually execute the sweep (default: plan/dry-run, no GPU)
   --profile P        workload profile: single | agents | multi (default: single)
+  --quick            fast screen: 1 rep/config (noisier, ~1/3 the time)
+  --full             thorough: 5 reps/config (steadier, slower)
   --driver bench|server  benchmark driver (default: from profile). 'server'
                      measures real generation incl. MTP + concurrency
   --parallel N       concurrent streams for the server driver
-  --array L25|L125   Taguchi array (default: L25, or 'auto')
+  --array A          orthogonal array (default: auto-picks the smallest that
+                     fits your factors; advanced: force L9/L18/L25/L27/L125/...)
   --ctx-floor N      minimum usable context for BALANCED (default: from profile)
   --probe-ctx        after the sweep, binary-search the largest context that
                      loads for the fastest config (needs --run)

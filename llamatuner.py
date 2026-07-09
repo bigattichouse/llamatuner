@@ -382,6 +382,35 @@ def build_factors(cfg: Config):
     return factors
 
 
+# Orthogonal-array capacity: name -> number of columns (factors) it holds.
+_ARRAY_TABLES = {
+    2: [("L4", 3), ("L8", 7), ("L16", 15), ("L32", 31), ("L64", 63), ("L128", 127)],
+    3: [("L9", 4), ("L27", 13), ("L81", 40), ("L243", 121)],
+    5: [("L25", 6), ("L125", 31), ("L625", 156)],
+}
+
+
+def choose_array(factors: dict) -> str | None:
+    """Pick the smallest orthogonal array that fits the factor set, based on the
+    factors' level counts. Returns an array name, or None to let the binding
+    auto-select. Fixes the binding auto-selecting a 5-level array for 3-level
+    factors."""
+    counts = [len(v) for v in factors.values()]
+    if not counts:
+        return None
+    nf, mx, n2 = len(counts), max(counts), sum(1 for c in counts if c == 2)
+    # one 2-level factor mixed with 3-level factors is the classic L18 case
+    if mx == 3 and n2 >= 1 and nf <= 8:
+        return "L18"
+    base = 2 if mx <= 2 else 3 if mx == 3 else 5 if mx <= 5 else None
+    if base is None:
+        return None
+    for name, cap in _ARRAY_TABLES[base]:
+        if cap >= nf:
+            return name
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Taguchi run generation (via the python binding)
 # ---------------------------------------------------------------------------
@@ -939,6 +968,16 @@ def selftest() -> bool:
         # realistic prompt: varied text of ~n*4 chars, not a repeated token
         assert len(_realistic_prompt(100)) == 400
         assert len(set(_realistic_prompt(200))) > 20  # genuinely varied
+
+        # array auto-selection by factor levels
+        assert choose_array({f"f{i}": ["a", "b", "c", "d", "e"] for i in range(5)}) == "L25"
+        assert choose_array({f"f{i}": ["a", "b", "c"] for i in range(6)}) == "L27"
+        assert choose_array({f"f{i}": ["0", "1"] for i in range(7)}) == "L8"
+        assert choose_array({"a": ["0", "1"], "b": ["x", "y", "z"],
+                             "c": ["p", "q", "r"]}) == "L18"
+        # a fixed (1-level) factor among 3-level ones still picks a 3-level array
+        assert choose_array({"t": ["8"], "a": ["1", "2", "3"],
+                             "b": ["1", "2", "3"]}) == "L9"
     except AssertionError as e:
         print(f"selftest FAILED: {e}")
         return False
@@ -955,8 +994,13 @@ def main():
     ap.add_argument("model", type=Path, nargs="?", help="path to the GGUF model")
     ap.add_argument("--run", action="store_true",
                     help="actually execute the benchmark sweep (uses the GPU)")
-    ap.add_argument("--array", default="L25",
-                    help="Taguchi array (L25, L125, ..., or 'auto'); default L25")
+    ap.add_argument("--quick", action="store_true",
+                    help="fast screen: 1 rep per config (noisier, ~1/3 the time)")
+    ap.add_argument("--full", action="store_true",
+                    help="thorough: 5 reps per config (steadier numbers, slower)")
+    ap.add_argument("--array", default="auto",
+                    help="orthogonal array; default 'auto' picks the smallest that "
+                         "fits your factors. Advanced: force L9/L18/L25/L27/L125/...")
     ap.add_argument("--factor", action="append", default=[], metavar="NAME=v1,v2,...",
                     help="override/add a sweepable factor (repeatable), e.g. "
                          "--factor ngl=56,60,64 --factor nkvo=0,1 --factor poll=0,50")
@@ -986,8 +1030,8 @@ def main():
                          "loads for the fastest config (needs --run)")
     ap.add_argument("--selftest", action="store_true",
                     help="run offline logic checks and exit (no GPU, no model)")
-    ap.add_argument("--reps", type=int, default=BENCH_REPS,
-                    help=f"llama-bench repetitions per config (default {BENCH_REPS})")
+    ap.add_argument("--reps", type=int, default=None,
+                    help="repetitions per config (default: 3, or --quick=1/--full=5)")
     ap.add_argument("--n-prompt", type=int, default=None,
                     help="prompt tokens per measurement (default: from profile)")
     ap.add_argument("--n-gen", type=int, default=None,
@@ -1025,6 +1069,9 @@ def main():
     logical = detect_logical_cores()
     vram = detect_vram_mib()
 
+    if args.quick and args.full:
+        ap.error("--quick and --full are mutually exclusive")
+
     # resolve request shape from the profile, allowing explicit overrides
     prof = PROFILES[args.profile]
     n_prompt = args.n_prompt if args.n_prompt is not None else prof["n_prompt"]
@@ -1032,6 +1079,7 @@ def main():
     ctx_floor = args.ctx_floor if args.ctx_floor is not None else prof["ctx_floor"]
     driver = args.driver if args.driver is not None else prof["driver"]
     parallel = args.parallel if args.parallel is not None else prof.get("parallel", 1)
+    reps = args.reps if args.reps is not None else (1 if args.quick else 5 if args.full else BENCH_REPS)
 
     llama_bench = resolve_binary("llama-bench", args.llama_bench, args.llama_cpp)
     llama_server = resolve_binary("llama-server", args.llama_server, args.llama_cpp)
@@ -1042,7 +1090,7 @@ def main():
         llama_server=llama_server,
         array=args.array,
         ctx_floor=ctx_floor,
-        reps=args.reps,
+        reps=reps,
         n_prompt=n_prompt,
         n_gen=n_gen,
         max_depth=args.max_depth,
@@ -1081,6 +1129,10 @@ def main():
         cfg.factors[name] = levels
         cfg.env_factor_names.add(name)
 
+    # resolve the array now that the factor set is final
+    if str(cfg.array).lower() == "auto":
+        cfg.array = choose_array(cfg.factors) or "auto"
+
     print("=" * 70)
     print("llamatuner")
     print("=" * 70)
@@ -1101,6 +1153,8 @@ def main():
                   "speedup (bench can't); otherwise it's only emitted")
     print(f"profile    : {cfg.profile}  (request {cfg.n_prompt} prompt + "
           f"{cfg.n_gen} gen tokens; driver={cfg.driver})")
+    mode = "quick" if args.quick else "full" if args.full else "standard"
+    print(f"mode       : {mode}  ({cfg.reps} rep{'s' if cfg.reps != 1 else ''}/config)")
     print(f"array      : {cfg.array}   ctx floor: {cfg.ctx_floor}")
     print("\nfactors:")
     for name, levels in cfg.factors.items():
