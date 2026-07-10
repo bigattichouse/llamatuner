@@ -265,8 +265,9 @@ python3 llamatuner.py MODEL.gguf [options]
   --array A          orthogonal array (default: auto-picks the smallest that
                      fits your factors; advanced: force L9/L18/L25/L27/L125/...)
   --ctx-floor N      minimum usable context for BALANCED (default: from profile)
-  --probe-ctx        after the sweep, binary-search the largest context that
-                     loads for the fastest config (needs --run)
+  --no-probe         skip the max-context probe (runs by default: binary-searches
+                     the physical context ceiling for the furthest-reaching config,
+                     then prints a ready command at ~90% of it)
   --screen [R]       Morris pre-screen (R trajectories, default 6): rank knobs by
                      importance, drop the negligible ones, then sweep the rest
   --iterate N        run N auto-refining passes (screen -> refine -> ...): settle
@@ -425,7 +426,7 @@ python3 llamatuner.py model-UD.gguf --run --driver server \
   **randomized run order** + `--cooldown` to fight thermal drift.
 - **Robust** — incremental save + `--resume`; **crash journal** so a config that
   reboots the machine is skipped, not retried (`--retry-crashed` to override);
-  clear errors; `--selftest` (no GPU); `--probe-ctx` for max loadable context.
+  clear errors; `--selftest` (no GPU); max-context probe by default (`--no-probe` to skip).
 
 ## Roadmap / ideas
 

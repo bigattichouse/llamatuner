@@ -1423,8 +1423,10 @@ def build_child_argv(args, cfg: Config, factors: dict, results_path: Path,
             argv.append("--confirm")
         if args.html:
             argv += ["--html", str(args.html)]
-        if args.probe_ctx:
-            argv.append("--probe-ctx")
+        if args.no_probe:
+            argv.append("--no-probe")
+    else:
+        argv.append("--no-probe")  # only probe on the final pass
     return argv
 
 
@@ -1645,9 +1647,11 @@ def main():
                     help="explicit path to the llama-server binary")
     ap.add_argument("--ctx-floor", type=int, default=None,
                     help="minimum usable context for BALANCED (default: from profile)")
+    ap.add_argument("--no-probe", action="store_true",
+                    help="skip the max-context probe (which runs by default after "
+                         "the sweep: binary-searches the physical context ceiling)")
     ap.add_argument("--probe-ctx", action="store_true",
-                    help="after the sweep, binary-search the max context that "
-                         "loads for the fastest config (needs --run)")
+                    help=argparse.SUPPRESS)  # deprecated: the probe is now default
     ap.add_argument("--confirm", action="store_true",
                     help="after the sweep, run the predicted-optimal config to "
                          "verify the model's prediction (implied by --full)")
@@ -2045,18 +2049,30 @@ def main():
                        else "LARGE gap: interactions likely — trust the Pareto pick")
             print(f"  prediction error: {err:.0f}%  → {verdict}")
 
-    if args.probe_ctx:
+    if not args.no_probe:
         ok = [r for r in rows if r["status"] == "OK"]
         if ok:
-            fastest = max(ok, key=score_of)
+            # Probe the config that reaches FURTHEST (max measured depth, then
+            # fastest) — the memory-lightest good config — so this is the true
+            # physical ceiling, not the fastest config's (which may fit less).
+            base_row = max(ok, key=lambda r: (int(r["n_depth"]), score_of(r)))
             cap = cfg.hw.get("n_ctx_train") or 131072
-            print(f"\n### Max-context probe (fastest config, cap={cap})")
-            base = {k: fastest[k] for k in cfg.factors}
+            base = {k: base_row[k] for k in cfg.factors}
+            print(f"\n### Max-context probe  (config: ngl={base_row.get('ngl')} "
+                  f"kv={base_row.get('kv_type')} ub={base_row.get('ubatch')}, "
+                  f"cap={cap})")
             res = probe_max_context(cfg, base, args.timeout, cap)
             if res:
                 depth, tps = res
                 print(f"  largest context that loads: ~{depth} tokens"
                       + (f"  (tg={tps:.1f} t/s there)" if tps else ""))
+                # Turn the ceiling into a usable command: run just under it so
+                # there's headroom for runtime allocation/fragmentation (living at
+                # the exact edge risks an OOM mid-session), rounded to a tidy size.
+                safe = max(4096, int(depth * 0.9) // 1024 * 1024)
+                print(f"  → max-context command (-c {safe}, ~10% headroom under "
+                      f"the ceiling):")
+                print("    " + server_command(cfg, base_row, safe))
             else:
                 print("  even depth 0 failed to load — check the config")
 
