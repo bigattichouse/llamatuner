@@ -74,6 +74,24 @@ def resolve_binary(name: str, explicit: Path | None, hint: Path | None) -> Path:
     return default  # doesn't exist; caller validates and errors clearly
 
 
+def preflight(binary: Path, timeout: int = 60):
+    """Confirm the binary actually runs (not just exists) — catches a wrong build
+    or missing GPU libraries. Returns (ok, reason)."""
+    try:
+        out = subprocess.run([str(binary), "--help"], capture_output=True,
+                             text=True, timeout=timeout)
+    except FileNotFoundError:
+        return False, "not found / not executable"
+    except subprocess.TimeoutExpired:
+        return False, "hung running --help"
+    except OSError as e:
+        return False, f"failed to execute ({e})"
+    if out.returncode != 0:
+        tail = (out.stderr or out.stdout or "").strip().splitlines()[-3:]
+        return False, "exited nonzero — " + " ".join(tail)
+    return True, ""
+
+
 def find_taguchi_binding() -> Path:
     """Return the dir to add to sys.path so `import taguchi` works."""
     hits = sorted(
@@ -361,6 +379,7 @@ class Config:
     profile: str = "single"       # workload profile (see PROFILES)
     driver: str = "bench"         # "bench" (llama-bench) or "server" (llama-server)
     parallel: int = 1             # concurrent request streams (server driver)
+    server_start_timeout: int = 180  # max seconds to wait for llama-server to load
     factors: dict = field(default_factory=dict)
     hw: dict = field(default_factory=dict)
     env_factor_names: set = field(default_factory=set)  # factors that set env vars
@@ -571,7 +590,9 @@ def run_env(cfg: Config, f: dict) -> dict:
 
 def server_command(cfg: Config, f: dict, ctx: int) -> str:
     ub = int(f.get("ubatch", 512))
-    parts = [f"-m {cfg.model.name}", f"-c {ctx}", f"-mmp {FIXED_MMAP}"]
+    parts = [f"-m {cfg.model.name}", f"-c {ctx}"]
+    if not FIXED_MMAP:
+        parts.append("--no-mmap")
     if "fa" not in f:
         parts.append(f"-fa {FIXED_FA}")
     if "batch" not in f:
@@ -695,8 +716,10 @@ def build_server_args(cfg: Config, f: dict, port: int, n_ctx: int) -> list[str]:
     args = [
         str(cfg.llama_server), "-m", str(cfg.model),
         "--host", "127.0.0.1", "--port", str(port),
-        "-c", str(n_ctx), "-mmp", str(FIXED_MMAP),
+        "-c", str(n_ctx),                          # mmap on is the server default
     ]
+    if not FIXED_MMAP:
+        args.append("--no-mmap")                   # llama-server flag (NOT -mmp)
     if "fa" not in f:                              # flash-attn fixed unless swept
         args += ["-fa", str(FIXED_FA)]
     if "batch" not in f:
@@ -711,9 +734,11 @@ def build_server_args(cfg: Config, f: dict, port: int, n_ctx: int) -> list[str]:
     return args
 
 
-def _wait_health(port: int, deadline: float) -> bool:
+def _wait_health(port: int, deadline: float, proc=None) -> bool:
     url = f"http://127.0.0.1:{port}/health"
     while time.time() < deadline:
+        if proc is not None and proc.poll() is not None:
+            return False  # server process exited (died during load) — stop waiting
         try:
             with urllib.request.urlopen(url, timeout=2) as r:
                 if r.status == 200:
@@ -784,14 +809,23 @@ class ServerSession:
         self.proc = subprocess.Popen(args, stdout=subprocess.PIPE,
                                      stderr=subprocess.PIPE, text=True,
                                      env=run_env(cfg, launch_f))
-        if _wait_health(self.port, time.time() + timeout):
+        # Wait for the server to come up, but give up fast if the process dies
+        # (crashed on load) or exceeds the startup budget — don't hang for the
+        # whole per-run timeout.
+        start_deadline = time.time() + cfg.server_start_timeout
+        if _wait_health(self.port, start_deadline, self.proc):
             self.ok = True
         else:
+            died = self.proc.poll() is not None
             self.proc.terminate()
             try:
-                _, self.err = self.proc.communicate(timeout=10)
+                _, err = self.proc.communicate(timeout=10)
+                self.err = err or ""
             except subprocess.TimeoutExpired:
                 self.proc.kill()
+            if not self.err:
+                self.err = (f"server exited during load" if died else
+                            f"server not healthy within {cfg.server_start_timeout}s")
 
     def measure(self, prompt_len, n_gen, par, reps, timeout):
         prompt = _realistic_prompt(prompt_len)
@@ -1632,6 +1666,9 @@ def main():
                     help="explicit path to the llama-bench binary")
     ap.add_argument("--timeout", type=int, default=1200,
                     help="per-run timeout in seconds")
+    ap.add_argument("--server-start-timeout", type=int, default=180,
+                    help="max seconds to wait for llama-server to load before "
+                         "giving up on a config (default 180)")
     ap.add_argument("--results", type=Path, default=Path("results.csv"))
     ap.add_argument("--resume", action="store_true",
                     help="skip configs already present in --results (rows are "
@@ -1705,6 +1742,7 @@ def main():
         profile=args.profile,
         driver=driver,
         parallel=parallel,
+        server_start_timeout=args.server_start_timeout,
         hw={"phys": phys, "logical": logical, "n_layers": n_layers, "vram": vram,
             "n_experts": n_experts, "n_ctx_train": n_ctx_train, "n_nextn": n_nextn},
     )
@@ -1782,8 +1820,9 @@ def main():
     print("\nfactors:")
     for name, levels in cfg.factors.items():
         print(f"  {name:10s}: {', '.join(levels)}")
-    print(f"fixed      : -fa {FIXED_FA}  -mmp {FIXED_MMAP}  -b {FIXED_BATCH}  "
-          f"(-p {cfg.n_prompt} -n {cfg.n_gen} -r {cfg.reps})")
+    print(f"fixed      : flash-attn {'on' if FIXED_FA else 'off'}, "
+          f"mmap {'on' if FIXED_MMAP else 'off'}, batch {FIXED_BATCH}  "
+          f"(p={cfg.n_prompt} n={cfg.n_gen} reps={cfg.reps})")
 
     try:
         exp, runs = generate_runs(cfg.factors, cfg.array)
@@ -1815,6 +1854,14 @@ def main():
             "  Need the path to your llama.cpp build. Pass --llama-cpp "
             "/path/to/llama.cpp\n  (its build/bin dir), set $LLAMA_CPP, put it on "
             f"$PATH, or pass --{needed.name} directly.")
+
+    # preflight: confirm the binary actually runs (catches missing GPU libs / a
+    # wrong build) in a couple of seconds, instead of failing deep in the sweep.
+    ok, why = preflight(needed)
+    if not ok:
+        ap.error(f"{needed.name} at {needed} won't run: {why}\n"
+                 "  Is it built for your GPU? Check its ROCm/CUDA/Metal libraries "
+                 "are on the loader path (e.g. LD_LIBRARY_PATH), or rebuild llama.cpp.")
 
     # --- execute sweep ---
     cols = (["run_id"] + list(cfg.factors.keys())
