@@ -1200,11 +1200,13 @@ def _svg_pareto(rows: list[dict], vram_total: float = 0) -> str:
     mr = 58 if have_vram else 16
     xmax = max((x for x, _ in pts), default=1) or 1
     ys = [y for _, y in pts]
-    # zoom the left y-axis to ~10% around the data (NOT from 0) so small variation is
-    # visible — otherwise a near-flat throughput curve looks like a straight line
-    ylo, yhi = min(ys) * 0.9, max(ys) * 1.1
-    if yhi - ylo < 1e-6:
-        ylo, yhi = ylo - 1, yhi + 1
+    # zoom the left y-axis to 10% of the data *range* beyond each end (NOT 10% of the
+    # value, and NOT from 0) so the actual variation fills ~80% of the height —
+    # otherwise a high-baseline low-spread curve (e.g. the 270M model, ~450 t/s with
+    # ~20 spread) still looks like a flat horizontal line.
+    lo, hi = min(ys), max(ys)
+    pad = (hi - lo) * 0.1 or max(hi * 0.05, 1)
+    ylo, yhi = lo - pad, hi + pad
     # right VRAM axis: from 0 to the physical ceiling (or headroom above peak)
     vhi = max([v for _, v in vpts] + [vram_total]) * 1.05 if have_vram else 1
 
