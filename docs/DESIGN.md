@@ -44,8 +44,10 @@ These are the starting beliefs that shaped the factor set. The sweep exists to
 - **Threads ≈ physical cores.** More threads than physical cores usually hurts. →
   thread levels are auto-derived to bracket the physical-core count.
 - **mmap on** unless benchmarking locked memory. → fixed `-mmp 1`.
-- **KV-cache quantization** (`q8_0` … `q4_0`) trades a little quality for
-  substantially more context in the same VRAM. → 5-level factor.
+- **KV-cache quantization** (`f16`/`q8_0` … `q4_0`) trades a little quality for
+  substantially more context in the same VRAM. → a quality-gated factor: `--min-kv`
+  floors it (default `q8_0`, near-lossless) so only `f16, q8_0` are swept unless you
+  opt into the lossier ladder with `--min-kv any`.
 
 ## Sampling settings (out of scope for the sweep, kept for reference)
 

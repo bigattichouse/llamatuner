@@ -33,38 +33,66 @@ python3 llamatuner.py /path/to/model.gguf --run --screen --iterate 3 --html repo
 
 ---
 
-## Why Taguchi instead of a full sweep?
+## Why designed experiments (Morris + Taguchi) instead of a full sweep?
 
 The knobs that matter for llama.cpp throughput interact, and testing every
-combination explodes fast. With 5 factors at 5 levels each, a full factorial is
-`5^5 = 3125` benchmark runs. A Taguchi **L25** orthogonal array estimates every
-factor's main effect in **25 runs** — a >99% reduction — while keeping the levels
-balanced so each factor's effect can be read independently.
+combination explodes fast. With 5 factors at 5 levels each a full factorial is
+`5^5 = 3125` runs; add a dozen more `--factor`s and it's astronomical. `llamatune`
+replaces the sweep with a **two-stage DOE funnel**, both stages powered by the
+vendored [`robust`](https://github.com/bigattichouse/robust) suite:
 
-We use the vendored `robust`/`taguchi` library via its Python binding to generate
-the runs and to compute main effects. The `robust` suite also ships `morris` and
-`sobol` binaries for the wider screening funnel (see Roadmap).
+**1. Morris screening (`--screen`) — "which knobs even matter?"** Elementary-effects
+screening walks `R` trajectories through the factor space (~`R·(k+1)` runs) and, for
+every knob, reports **μ\*** (how much it moves throughput) and **σ** (how much its
+effect depends on the others — i.e. interactions/nonlinearity). Negligible knobs get
+**dropped** (pinned at their best-seen level) so the expensive stage never wastes
+runs on them. This is what makes it practical to throw a dozen `--factor`s at the
+tool. Runs the `robust` **morris** binary.
+
+**2. Taguchi orthogonal array — "what's the optimum among the survivors?"** A Taguchi
+**L25** array estimates every surviving factor's main effect in **25 runs** instead
+of 3125 — a >99% reduction — keeping the levels balanced so each effect reads
+independently. `--iterate` then refines: it settles the low-impact factors at their
+winner and re-runs the high-impact ones on a finer grid, converging on the optimum.
+`--confirm` measures the predicted-optimal config directly to check the additive
+model held. Runs the `robust`/`taguchi` library via its Python binding.
+
+```
+many knobs ─► MORRIS (μ*, σ; ~R·(k+1) runs) ─► the few that matter
+           ─► TAGUCHI L-array + --iterate ─► --confirm ─► optimum
+```
+
+Both stages are optional and compose: `--screen` alone screens, a bare `--run` goes
+straight to Taguchi, and `--screen --iterate N --confirm` runs the whole funnel.
+(**Sobol** variance attribution was considered and dropped — see Roadmap; Morris `σ`
+already flags interactions cheaply.)
 
 ---
 
 ## What it tunes
 
-Five factors, five levels each (auto-scaled to your hardware and model):
+Five factors by default (auto-scaled to your hardware and model):
 
 | Factor        | llama-bench flag | Levels (example, Qwen3.6-27B on MI50) | Notes |
 |---------------|------------------|----------------------------------------|-------|
 | GPU layers    | `-ngl`           | `0, 16, 32, 48, 64`                    | biggest lever; top = model's real layer count |
 | Context depth | `-d` (n-depth)   | 5 levels `0..min(native ctx, 65536)`   | KV pre-fill; the speed-vs-context axis, adaptive to the model's native context |
 | CPU threads   | `-t`             | `4, 6, 8, 12, 16`                      | auto-derived around the physical-core count |
-| KV cache type | `-ctk`/`-ctv`    | `f16, q8_0, q5_1, q4_1, q4_0`          | quantizing the KV cache buys context |
+| KV cache type | `-ctk`/`-ctv`    | `f16, q8_0` (default)                  | KV precision; **floored to near-lossless** by `--min-kv q8_0` |
 | Micro-batch   | `-ub`            | `128, 256, 512, 1024, 2048`            | prefill/decode balance |
 
-**Fixed** (not swept): `-fa 1` (flash-attention on — a near-certain win on gfx906
-and a *precondition* for quantized KV cache), `-mmp 1` (mmap on), `-b 2048` (batch
-fixed to avoid invalid `batch < ubatch` combinations).
+The KV factor is quality-gated: `--min-kv` (default `q8_0`, near-lossless) drops the
+lossier levels so the tool never recommends a KV type that degrades output over long
+context. Pass `--min-kv any` to explore the full `f16, q8_0, q5_1, q4_1, q4_0` ladder
+(quantizing the KV cache buys context at some quality cost).
 
-L25 has 6 columns; using 5 factors leaves **one spare column** as an error/variance
-estimate that flags when the additive main-effects model is breaking down.
+**Fixed** (not swept): flash-attention on (`-fa 1` — a near-certain win on gfx906 and
+a *precondition* for quantized KV cache), mmap on (bench `-mmp 1`; the server default),
+batch `-b 2048` (fixed to avoid invalid `batch < ubatch` combinations). Any of these
+can still be swept explicitly with `--factor` (e.g. `--factor fa=0,1`).
+
+With 5 factors an L25 array has one spare column left as an error/variance estimate
+that flags when the additive main-effects model is breaking down.
 
 ---
 
@@ -216,8 +244,9 @@ many knobs ─► MORRIS (μ*, σ; ~R·(k+1) runs) ─► the few that matter �
 ```
 
 Morris is *screening*, not optimization — it answers "which knobs matter?" cheaply,
-so the expensive sweep only spends runs where they count. (Sobol variance attribution
-would run on a surrogate fit to this data — see Roadmap.)
+so the expensive Taguchi sweep only spends runs where they count. (Sobol variance
+attribution was considered for quantifying interaction strength and dropped — see
+Roadmap; Morris `σ` already flags interactions for free.)
 
 **Automatic:** let the tool do the staging for you —
 ```bash
@@ -275,9 +304,11 @@ order (default) plus `--full` reps already averages out most drift.
 - The `robust`/`taguchi` submodule, checked out and built:
   ```bash
   git submodule update --init          # fetch the robust DOE suite
-  make -C taguchi                      # build libtaguchi.so (pure C, no GPU)
+  make -C taguchi                      # build libtaguchi.so + the morris binary (pure C, no GPU)
   ```
-  `llamatuner` locates the Python binding automatically by searching the submodule.
+  This one build covers both funnel stages: `llamatuner` finds the Taguchi Python
+  binding (for the array + main-effects) and the `morris` binary in
+  `taguchi/build/bin/` (for `--screen`) automatically by searching the submodule.
 - Python 3.10+ (uses `X | None` type syntax), standard library only.
 
 ---
