@@ -44,8 +44,8 @@ project (`robust`) that git tracks as a *submodule*: a plain `git clone` leaves 
 
 ```bash
 # if you're cloning fresh, grab the submodule in one step:
-git clone --recurse-submodules <llamatune-repo-url>
-cd llamatune
+git clone --recurse-submodules https://github.com/bigattichouse/llamatuner
+cd llamatuner
 
 # already cloned (or downloaded a zip) without the submodule? fetch it now:
 git submodule update --init
