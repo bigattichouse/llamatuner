@@ -1,4 +1,4 @@
-# llamatune
+# llamatuner
 
 Find good `llama.cpp` command-line parameters for a given GGUF model **on your
 machine**, automatically, using statistically-designed experiments instead of a
