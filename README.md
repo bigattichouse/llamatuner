@@ -158,6 +158,26 @@ Full per-run data is written to `results.csv`.
 
 ## Recommended workflow (staged / iterative refinement)
 
+**Many knobs? Screen first (the funnel).** With a dozen-plus `--factor`s, run a
+**Morris pre-screen** to find which knobs even matter before spending a full sweep:
+```bash
+python3 llamatuner.py model.gguf --run --screen --iterate 2 \
+  --factor ngl=0,64 --factor ubatch=128,2048 --factor kv_type=f16,q8_0,q4_0 \
+  --factor nkvo=0,1 --factor poll=0,50 --factor ot=none,ffn_cpu
+```
+`--screen [R]` uses the vendored `robust` **morris** tool: ~`R·(k+1)` cheap runs to
+rank every knob by **μ\*** (importance) and flag **σ** (interaction/nonlinearity).
+It then **drops the negligible knobs** (fixed at their best-seen level) and continues
+into the Taguchi sweep / `--iterate` on the ones that matter. That's the funnel:
+
+```
+many knobs ─► MORRIS (μ*, σ; ~R·(k+1) runs) ─► the few that matter ─► TAGUCHI/--iterate ─► optimum
+```
+
+Morris is *screening*, not optimization — it answers "which knobs matter?" cheaply,
+so the expensive sweep only spends runs where they count. (Sobol variance attribution
+would run on a surrogate fit to this data — see Roadmap.)
+
 **Automatic:** let the tool do the staging for you —
 ```bash
 python3 llamatuner.py model.gguf --run --iterate 3
@@ -238,6 +258,8 @@ python3 llamatuner.py MODEL.gguf [options]
   --ctx-floor N      minimum usable context for BALANCED (default: from profile)
   --probe-ctx        after the sweep, binary-search the largest context that
                      loads for the fastest config (needs --run)
+  --screen [R]       Morris pre-screen (R trajectories, default 6): rank knobs by
+                     importance, drop the negligible ones, then sweep the rest
   --iterate N        run N auto-refining passes (screen -> refine -> ...): settle
                      low-impact factors, refine high-impact ones on a finer grid
   --confirm          run the predicted-optimal config to verify the additive
@@ -388,9 +410,10 @@ python3 llamatuner.py model-UD.gguf --run --driver server \
 
 ## Roadmap / ideas
 
-- **Morris/Sobol pre-screen** — the vendored `robust` suite ships `morris` and `sobol`
-  binaries. Use Morris to screen which factors matter (μ\* importance, σ interaction
-  flag) before committing to the full Taguchi bench, and Sobol for variance/interaction
-  attribution when L25's error estimate says the additive model is shaky.
+- **Sobol variance attribution (on a surrogate)** — Sobol needs `N·(k+2)` samples
+  (thousands) to converge, so it can't run on live benchmarks. The plan: fit a cheap
+  surrogate (polynomial/GP/forest) to the runs already collected by Morris + Taguchi,
+  then run Sobol on the *surrogate* (microseconds/eval, free) for first-order and
+  total-order interaction indices. Morris screening (`--screen`) is already done.
 
 See [`docs/DESIGN.md`](docs/DESIGN.md) for the background and tuning hypotheses.

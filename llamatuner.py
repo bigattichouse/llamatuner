@@ -1328,6 +1328,11 @@ def selftest() -> bool:
         assert factor_flags(cfg_s, {"fa": "0"}, "bench", 512) == [["-fa", "0"]]
         assert factor_flags(cfg_s, {"nkvo": "1"}, "server", 512) == [["-nkvo"]]  # bare
         assert factor_flags(cfg_s, {"nkvo": "1"}, "bench", 512) == [["-nkvo", "1"]]
+
+        # morris analyze table parsing
+        mtxt = ("Factor  mu*  sigma  note\n------  ----  -----  ----\n"
+                "ubatch  96  0\nngl  32  0.001  \n\nRanked by mu* ...\n")
+        assert parse_morris_analyze(mtxt) == [("ubatch", 96.0, 0.0), ("ngl", 32.0, 0.001)]
     except AssertionError as e:
         print(f"selftest FAILED: {e}")
         return False
@@ -1424,6 +1429,145 @@ def run_iterations(args, cfg: Config):
 
 
 # ---------------------------------------------------------------------------
+# Morris screening (funnel stage 1): rank many knobs by importance (mu*) and flag
+# interactions (sigma) at ~r*(k+1) runs, using the vendored `robust` morris tool
+# for the design + analysis and our own driver (with crash journal) for the runs.
+# ---------------------------------------------------------------------------
+def find_robust_binary(name: str) -> Path:
+    p = SUBMODULE_DIR / "build" / "bin" / name
+    if p.exists():
+        return p
+    hits = list(SUBMODULE_DIR.glob(f"**/bin/{name}"))
+    return hits[0] if hits else p
+
+
+def parse_morris_analyze(text: str):
+    """Parse the morris analyze table into [(factor, mu_star, sigma), ...]."""
+    out, started = [], False
+    for line in text.splitlines():
+        if line.startswith("------"):
+            started = True
+            continue
+        if started:
+            if not line.strip():
+                break
+            parts = line.split()
+            if len(parts) >= 3:
+                try:
+                    out.append((parts[0], float(parts[1]), float(parts[2])))
+                except ValueError:
+                    pass
+    return out
+
+
+def morris_screen(cfg: Config, args, ap, trajectories: int):
+    """Run a Morris screen; report mu*/sigma; reduce cfg.factors to the ones that
+    matter (drop negligible ones, fixed at their best-seen level)."""
+    morris = find_robust_binary("morris")
+    if not morris.exists():
+        ap.error(f"morris binary not found at {morris}; build it: "
+                 f"make -C {SUBMODULE_DIR}")
+    base = args.results
+    space_path = Path(str(base) + ".space")
+    res_path = Path(str(base) + ".morris_results.csv")
+    journal_path = Path(str(base) + ".journal")
+
+    def is_cat(name):
+        return FACTORS.get(name, {}).get("kind") == "cat" or name in cfg.env_factor_names
+
+    # .space: numeric factors as [min,max]; categoricals as [0, n-1] index space
+    lines = ["factors:"]
+    for name, levels in cfg.factors.items():
+        if is_cat(name):
+            lines.append(f"  {name}: 0, {max(1, len(levels) - 1)}")
+        else:
+            nums = sorted(float(x) for x in levels)
+            lo, hi = nums[0], (nums[-1] if nums[-1] != nums[0] else nums[0] + 1)
+            lines.append(f"  {name}: {lo:g}, {hi:g}")
+    seed = args.seed if args.seed is not None else 42
+    lines += [f"trajectories: {trajectories}", "grid_levels: 4", f"seed: {seed}"]
+    space_path.write_text("\n".join(lines) + "\n")
+
+    out = subprocess.run([str(morris), "sample", str(space_path)],
+                         capture_output=True, text=True)
+    if out.returncode != 0:
+        ap.error(f"morris sample failed: {out.stderr.strip()}")
+    design = list(csv.DictReader(out.stdout.splitlines()))
+    print(f"\n{'#' * 70}\n# MORRIS SCREEN — {trajectories} trajectories, "
+          f"{len(design)} runs (r*(k+1)={trajectories}*{len(cfg.factors) + 1})\n{'#' * 70}")
+
+    def map_point(row):
+        f = {}
+        for name, levels in cfg.factors.items():
+            v = float(row[name])
+            if is_cat(name):
+                f[name] = levels[max(0, min(len(levels) - 1, int(round(v))))]
+            else:
+                f[name] = str(min(levels, key=lambda L: abs(float(L) - v)))
+        return f
+
+    cache, rows = {}, []
+    journal = open(journal_path, "a")
+    fh = open(res_path, "w", newline="")
+    w = csv.writer(fh)
+    w.writerow(["run_id", "eff_tps"])
+    fh.flush()
+    try:
+        for j, row in enumerate(design, 1):
+            rid = row.get("run_id", str(j))
+            f = map_point(row)
+            ckey = tuple(sorted(f.items()))
+            if ckey in cache:
+                eff, status = cache[ckey], "OK(cached)"
+            else:
+                prefix = (f"[screen {j}/{len(design)}] "
+                          + " ".join(f"{k}={f[k]}" for k in cfg.factors))
+                journal_write(journal, "TRY", "run", f"screen-{rid}", json.dumps(f))
+                res = with_ticker(prefix, args.timeout,
+                                  lambda ff=f: drive_one(cfg, ff, args.timeout))
+                eff = effective_tps(cfg.n_prompt, cfg.n_gen, res["pp_tps"], res["tg_tps"])
+                status = res["status"]
+                cache[ckey] = eff
+                print(f"{prefix} -> {status} eff={eff:.1f} t/s", flush=True)
+            rows.append({"status": "OK" if eff > 0 else status, "eff_tps": eff, **f})
+            w.writerow([rid, f"{eff:.4f}"])
+            fh.flush()
+    finally:
+        fh.close()
+        journal.close()
+
+    out = subprocess.run([str(morris), "analyze", str(space_path), str(res_path),
+                          "--metric", "eff_tps"], capture_output=True, text=True)
+    print("\n" + out.stdout)
+    rankings = parse_morris_analyze(out.stdout)
+    if not rankings:
+        print("(morris analyze returned no rankings — keeping all factors)")
+        return
+
+    max_mu = max(mu for _, mu, _ in rankings) or 1.0
+    keep = [n for n, mu, _ in rankings if mu >= 0.1 * max_mu]
+    if not keep:                       # never drop everything
+        keep = [rankings[0][0]]
+    dropped = [n for n, _, _ in rankings if n not in keep]
+    interacting = [n for n, mu, s in rankings if mu > 0 and s >= mu / 2]
+
+    print(f"KEEP (matter): {', '.join(keep)}")
+    if dropped:
+        print(f"DROP (negligible, fixed at best): {', '.join(dropped)}")
+    if interacting:
+        print(f"INTERACTION/nonlinear (σ≥μ*/2): {', '.join(interacting)}")
+
+    best = {}
+    for name in cfg.factors:
+        means = factor_level_means(rows, name)
+        if means:
+            best[name] = max(means, key=means.get)
+    cfg.factors = {name: (levels if name in keep else [str(best.get(name, levels[0]))])
+                   for name, levels in cfg.factors.items()}
+    print("→ continuing to the Taguchi sweep on the factors that matter.\n")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 def main():
@@ -1509,6 +1653,10 @@ def main():
                     help="run N refinement passes: each settles the low-impact "
                          "factors at their winner and refines the high-impact ones "
                          "onto a finer grid (screen -> refine -> ...). default 1")
+    ap.add_argument("--screen", type=int, nargs="?", const=6, default=None, metavar="R",
+                    help="Morris pre-screen with R trajectories (default 6) to rank "
+                         "knobs by importance and drop the negligible ones before the "
+                         "sweep — cheap (~R*(k+1) runs). Great with many --factor knobs.")
     args = ap.parse_args()
 
     if args.selftest:
@@ -1589,6 +1737,13 @@ def main():
             ap.error(f"--env expects NAME=v1,v2,... (got '{spec}')")
         cfg.factors[name] = levels
         cfg.env_factor_names.add(name)
+
+    # funnel stage 1: Morris pre-screen (reduces cfg.factors to the ones that
+    # matter) before the Taguchi sweep / iterate. Runs in the parent, not children.
+    if args.screen and not os.environ.get("LLAMATUNE_CHILD"):
+        if not args.run:
+            ap.error("--screen needs --run")
+        morris_screen(cfg, args, ap, args.screen)
 
     # iterative refinement: orchestrate N passes as subprocesses of this tool
     if args.iterate > 1 and not os.environ.get("LLAMATUNE_CHILD"):
