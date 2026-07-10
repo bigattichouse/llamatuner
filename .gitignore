@@ -11,6 +11,7 @@ results.csv
 *.html
 *.journal
 *.space
+results/
 *_results.csv
 
 # Models (never commit multi-GB GGUFs)

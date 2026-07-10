@@ -1666,8 +1666,13 @@ def main():
                          "binaries aren't auto-found.")
     ap.add_argument("--llama-server", type=Path, default=None,
                     help="explicit path to the llama-server binary")
-    ap.add_argument("--ctx-floor", type=int, default=None,
-                    help="minimum usable context for BALANCED (default: from profile)")
+    ap.add_argument("--min-context", "--ctx-floor", type=int, default=None,
+                    dest="ctx_floor",
+                    help="minimum context you need — BALANCED targets it "
+                         "(default: from profile)")
+    ap.add_argument("--ctx-size", "-c", type=int, default=None,
+                    help="tune at a FIXED context size (like llama.cpp -c): "
+                         "shorthand for --min-context N --max-context N")
     ap.add_argument("--no-probe", action="store_true",
                     help="skip the max-context probe (which runs by default after "
                          "the sweep: binary-searches the physical context ceiling)")
@@ -1684,8 +1689,10 @@ def main():
                     help="prompt tokens per measurement (default: from profile)")
     ap.add_argument("--n-gen", type=int, default=None,
                     help="generated tokens per measurement (default: from profile)")
-    ap.add_argument("--max-depth", type=int, default=None,
-                    help="cap n_depth factor levels (memory/time budget)")
+    ap.add_argument("--max-context", "--max-depth", type=int, default=None,
+                    dest="max_depth",
+                    help="cap the context axis and the ceiling probe at this "
+                         "many tokens (don't explore above it)")
     ap.add_argument("--min-kv", default="q8_0", metavar="TYPE",
                     help="KV-cache quality floor: never consider a KV type lossier "
                          "than this (default q8_0, near-lossless). 'any' explores "
@@ -1702,7 +1709,11 @@ def main():
     ap.add_argument("--server-start-timeout", type=int, default=180,
                     help="max seconds to wait for llama-server to load before "
                          "giving up on a config (default 180)")
-    ap.add_argument("--results", type=Path, default=Path("results.csv"))
+    ap.add_argument("--results-dir", type=Path, default=Path("results"),
+                    help="directory for all output (default: results/)")
+    ap.add_argument("--results", type=Path, default=Path("results.csv"),
+                    help="results CSV name, placed in --results-dir (the journal, "
+                         "HTML, and per-pass files land beside it)")
     ap.add_argument("--resume", action="store_true",
                     help="skip configs already present in --results (rows are "
                          "saved incrementally, so an interrupted sweep resumes)")
@@ -1740,6 +1751,16 @@ def main():
     if not args.model.exists():
         ap.error(f"model not found: {args.model}")
 
+    # place relative output names inside --results-dir; absolute paths are honored
+    if not args.results.is_absolute():
+        args.results = args.results_dir / args.results
+    if args.html is not None and not args.html.is_absolute():
+        args.html = args.results_dir / args.html
+    if args.run:  # ensure the output directory exists
+        args.results.parent.mkdir(parents=True, exist_ok=True)
+        if args.html:
+            args.html.parent.mkdir(parents=True, exist_ok=True)
+
     meta = read_gguf_metadata(args.model)
     n_layers = model_block_count(meta)
     n_experts = model_expert_count(meta)
@@ -1751,6 +1772,11 @@ def main():
 
     if args.quick and args.full:
         ap.error("--quick and --full are mutually exclusive")
+
+    # --ctx-size N: fix context at N (min == max), like llama.cpp -c
+    if args.ctx_size is not None:
+        args.ctx_floor = args.ctx_size
+        args.max_depth = args.ctx_size
 
     # resolve request shape from the profile, allowing explicit overrides
     prof = PROFILES[args.profile]
@@ -1784,6 +1810,8 @@ def main():
             "n_experts": n_experts, "n_ctx_train": n_ctx_train, "n_nextn": n_nextn},
     )
     cfg.factors = build_factors(cfg)
+    if args.ctx_size is not None:            # fixed context: don't sweep n_depth
+        cfg.factors["n_depth"] = [str(args.ctx_size)]
 
     # apply --factor overrides / additions
     for spec in args.factor:
@@ -1840,16 +1868,20 @@ def main():
             base["kv_type"] = max(cfg.factors["kv_type"],
                                   key=lambda k: KV_QUALITY.index(k) if k in KV_QUALITY else 0)
         cap = cfg.hw.get("n_ctx_train") or 131072
+        if args.max_depth:                       # --max-context caps the scan
+            cap = min(cap, args.max_depth)
         print(f"### Context scan — probing the physical ceiling first "
               f"(ngl={base.get('ngl')} kv={base.get('kv_type')}, cap={cap})...")
         res = probe_max_context(cfg, base, args.timeout, cap)
         if not res:
             ap.error("--ctx-scan: base config failed to load even at depth 0")
         ceiling = res[0]
-        depths = sorted({max(0, int(ceiling * fr) // 1024 * 1024)
+        lo = args.ctx_floor or 0                  # --min-context sets the low end
+        depths = sorted({max(0, (lo + int((ceiling - lo) * fr)) // 1024 * 1024)
                          for fr in (0.0, 0.25, 0.5, 0.75, 0.9)})
         cfg.factors["n_depth"] = [str(d) for d in depths]
-        print(f"physical ceiling ~{ceiling} tokens → n_depth axis: {depths}\n")
+        print(f"physical ceiling ~{ceiling} tokens → n_depth axis "
+              f"[{lo}..{ceiling}]: {depths}\n")
 
     # funnel stage 1: Morris pre-screen (reduces cfg.factors to the ones that
     # matter) before the Taguchi sweep / iterate. Runs in the parent, not children.
@@ -2116,7 +2148,7 @@ def main():
                        else "LARGE gap: interactions likely — trust the Pareto pick")
             print(f"  prediction error: {err:.0f}%  → {verdict}")
 
-    if not args.no_probe:
+    if not args.no_probe and args.ctx_size is None:   # fixed context: no ceiling search
         ok = [r for r in rows if r["status"] == "OK"]
         if ok:
             # Probe the config that reaches FURTHEST (max measured depth, then
@@ -2124,6 +2156,8 @@ def main():
             # physical ceiling, not the fastest config's (which may fit less).
             base_row = max(ok, key=lambda r: (int(r["n_depth"]), score_of(r)))
             cap = cfg.hw.get("n_ctx_train") or 131072
+            if cfg.max_depth:                          # --max-context caps the search
+                cap = min(cap, cfg.max_depth)
             base = {k: base_row[k] for k in cfg.factors}
             print(f"\n### Max-context probe  (config: ngl={base_row.get('ngl')} "
                   f"kv={base_row.get('kv_type')} ub={base_row.get('ubatch')}, "

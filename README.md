@@ -264,7 +264,9 @@ python3 llamatuner.py MODEL.gguf [options]
   --parallel N       concurrent streams for the server driver
   --array A          orthogonal array (default: auto-picks the smallest that
                      fits your factors; advanced: force L9/L18/L25/L27/L125/...)
-  --ctx-floor N      minimum usable context for BALANCED (default: from profile)
+  --min-context N    minimum context you need — BALANCED targets it (alias: --ctx-floor)
+  --max-context N    cap the context axis and the ceiling probe (alias: --max-depth)
+  --ctx-size N, -c N tune at a FIXED context (like llama.cpp -c) = min==max==N
   --no-probe         skip the max-context probe (runs by default: binary-searches
                      the physical context ceiling for the furthest-reaching config,
                      then prints a ready command at ~90% of it)
@@ -292,7 +294,8 @@ python3 llamatuner.py MODEL.gguf [options]
   --timeout SECS     per-run timeout (default: 1200)
   --server-start-timeout SECS  give up on a config if llama-server doesn't load
                      in this long (default: 180; also fails fast if it dies)
-  --results PATH     results CSV output (default: results.csv)
+  --results-dir DIR  directory for all output (default: results/, gitignored)
+  --results NAME     results CSV name inside --results-dir (default: results.csv)
   --resume           skip runs already in --results (rows save incrementally,
                      so an interrupted sweep can be resumed)
   --retry-crashed    on resume, also retry configs that were started but never
