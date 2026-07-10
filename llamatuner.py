@@ -22,6 +22,7 @@ import json
 import os
 import random
 import re
+import shlex
 import shutil
 import struct
 import socket
@@ -432,45 +433,117 @@ def generate_runs(factors: dict, array: str | None):
 # ---------------------------------------------------------------------------
 # Command building + execution
 # ---------------------------------------------------------------------------
-# Factor name -> llama-bench flag(s). kv_type applies its value to both -ctk/-ctv.
-# Extend this map to make a new llama-bench parameter sweepable as a factor.
-BENCH_FLAG = {
-    "ngl": ("-ngl",),
-    "threads": ("-t",),
-    "ubatch": ("-ub",),
-    "n_depth": ("-d",),
-    "ncmoe": ("-ncmoe",),
-    "kv_type": ("-ctk", "-ctv"),
-    "batch": ("-b",),
-    "nkvo": ("-nkvo",),
-    "poll": ("--poll",),
+# Named -override-tensor patterns → real llama.cpp tensor regex. "none" emits
+# nothing. These place whole tensor classes on CPU to free VRAM for more layers.
+OT_PATTERNS = {
+    "none": "",
+    "ffn_cpu": r"\.ffn_(gate|up|down)\.weight=CPU",   # all FFN on CPU (dense)
+    "ffn_up_cpu": r"\.ffn_up\.weight=CPU",
+    "exps_cpu": r"\.ffn_.*_exps\.=CPU",               # MoE experts on CPU
+    "attn_cpu": r"\.attn_.*=CPU",
 }
+
+# ---------------------------------------------------------------------------
+# Unified knob registry — the one place to add a tunable. Each factor declares
+# how it maps onto each driver.
+#   bench/server : flag tuple for that driver, or None if unsupported there
+#   kind         : "num"   integer, refined onto a finer grid between passes
+#                  "float" real value, refined by keeping top levels
+#                  "cat"   categorical, refined by keeping top levels
+#                  "bool"  0/1; bench takes the value, server emits a bare flag
+#   server_only  : only meaningful with the server driver
+#   request      : request-time (n_depth) — not a server launch arg
+#   translate    : map named level -> real value ("" ⇒ omit the flag)
+# ---------------------------------------------------------------------------
+FACTORS = {
+    # --- offload / placement ---
+    "ngl":          {"bench": ("-ngl",), "server": ("-ngl",), "kind": "num"},
+    "ncmoe":        {"bench": ("-ncmoe",), "server": ("-ncmoe",), "kind": "num"},
+    "ot":           {"bench": ("-ot",), "server": ("-ot",), "kind": "cat",
+                     "translate": OT_PATTERNS},
+    "nkvo":         {"bench": ("-nkvo",), "server": ("-nkvo",), "kind": "bool"},
+    # --- batching ---
+    "batch":        {"bench": ("-b",), "server": ("-b",), "kind": "num"},
+    "ubatch":       {"bench": ("-ub",), "server": ("-ub",), "kind": "num"},
+    # --- KV cache ---
+    "kv_type":      {"bench": ("-ctk", "-ctv"), "server": ("-ctk", "-ctv"), "kind": "cat"},
+    # --- CPU / threads ---
+    "threads":      {"bench": ("-t",), "server": ("-t",), "kind": "num"},
+    "threads_batch": {"bench": None, "server": ("-tb",), "kind": "num", "server_only": True},
+    "poll":         {"bench": ("--poll",), "server": ("--poll",), "kind": "num"},
+    "numa":         {"bench": ("--numa",), "server": ("--numa",), "kind": "cat"},
+    # --- attention ---
+    "fa":           {"bench": ("-fa",), "server": ("-fa",), "kind": "cat"},
+    # --- context (request-time) ---
+    "n_depth":      {"bench": ("-d",), "server": None, "kind": "num", "request": True},
+    # --- speculative decoding / MTP (server only) ---
+    "spec_n_max":   {"bench": None, "server": ("--spec-draft-n-max",), "kind": "num", "server_only": True},
+    "spec_n_min":   {"bench": None, "server": ("--spec-draft-n-min",), "kind": "num", "server_only": True},
+    "spec_p_min":   {"bench": None, "server": ("--spec-draft-p-min",), "kind": "float", "server_only": True},
+    "spec_p_split": {"bench": None, "server": ("--spec-draft-p-split",), "kind": "float", "server_only": True},
+    # --- concurrency (server only) ---
+    "parallel":     {"bench": None, "server": ("--parallel",), "kind": "num", "server_only": True},
+    # --- context extension / capability (server only) ---
+    "rope_scaling": {"bench": None, "server": ("--rope-scaling",), "kind": "cat", "server_only": True},
+    "yarn_factor":  {"bench": None, "server": ("--yarn-ext-factor",), "kind": "float", "server_only": True},
+}
+
+
+def factor_flags(cfg: Config, f: dict, driver: str, ub: int) -> list[list[str]]:
+    """Argument groups for the sweepable factors in `f` on the given driver, e.g.
+    [["-ngl","64"], ["-nkvo"], ["-ctk","f16"]]. Skips env factors, request-time
+    factors (n_depth), and factors unsupported on the driver. Handles kv (two
+    flags), booleans, batch clamp, and named -ot patterns."""
+    groups = []
+    for name, val in f.items():
+        spec = FACTORS.get(name)
+        if spec is None or name in cfg.env_factor_names:
+            continue
+        flags = spec.get(driver)
+        if flags is None or spec.get("request"):
+            continue
+        if spec.get("translate") is not None:
+            val = spec["translate"].get(str(val), str(val))
+            if val == "":
+                continue
+        if name == "batch":
+            val = str(max(int(val), ub))
+        if spec["kind"] == "bool":
+            if driver == "server":
+                if str(val) in ("1", "on", "true", "True"):
+                    groups.append([flags[0]])      # server: bare flag when enabled
+            else:
+                groups.append([flags[0], str(val)])  # bench: -flag 0|1
+        else:
+            for fl in flags:
+                groups.append([fl, str(val)])
+    return groups
+
+
+def _flat(groups: list[list[str]]) -> list[str]:
+    return [tok for g in groups for tok in g]
+
+
+def is_server_only(name: str) -> bool:
+    return bool(FACTORS.get(name, {}).get("server_only"))
 
 
 def bench_command(cfg: Config, f: dict) -> list[str]:
     cmd = [
         str(cfg.llama_bench),
         "-m", str(cfg.model),
-        "-fa", str(FIXED_FA),
         "-mmp", str(FIXED_MMAP),
         "-p", str(cfg.n_prompt),
         "-n", str(cfg.n_gen),
         "-r", str(cfg.reps),
         "-o", "json",
     ]
+    if "fa" not in f:                              # flash-attn fixed unless swept
+        cmd += ["-fa", str(FIXED_FA)]
     ub = int(f.get("ubatch", 512))
-    if "batch" not in f:  # batch fixed unless swept; llama-bench needs -b >= -ub
+    if "batch" not in f:                           # batch fixed; needs -b >= -ub
         cmd += ["-b", str(max(FIXED_BATCH, ub))]
-    for name, val in f.items():
-        if name in cfg.env_factor_names:
-            continue  # env vars are applied to the process, not the command line
-        flags = BENCH_FLAG.get(name)
-        if not flags:
-            continue
-        if name == "batch":
-            val = str(max(int(val), ub))
-        for fl in flags:
-            cmd += [fl, val]
+    cmd += _flat(factor_flags(cfg, f, "bench", ub))
     return cmd
 
 
@@ -484,34 +557,25 @@ def run_env(cfg: Config, f: dict) -> dict:
 
 
 def server_command(cfg: Config, f: dict, ctx: int) -> str:
-    batch = f.get("batch", str(FIXED_BATCH))
-    parts = [
-        "./llama-server",
-        f"-m {cfg.model.name}",
-        f"-ngl {f['ngl']}",
-        f"-t {f['threads']}",
-        f"-c {ctx}",
-        f"-ctk {f['kv_type']} -ctv {f['kv_type']}",
-        f"-ub {f['ubatch']} -b {batch}",
-        "-fa 1",
-    ]
-    if "ncmoe" in f:
-        parts.append(f"-ncmoe {f['ncmoe']}")
-    if f.get("nkvo") == "1":
-        parts.append("-nkvo")
-    if "poll" in f:
-        parts.append(f"--poll {f['poll']}")
-    par = int(f.get("parallel", cfg.parallel))
-    if par > 1:
-        parts.append(f"--parallel {par}")
+    ub = int(f.get("ubatch", 512))
+    parts = [f"-m {cfg.model.name}", f"-c {ctx}", f"-mmp {FIXED_MMAP}"]
+    if "fa" not in f:
+        parts.append(f"-fa {FIXED_FA}")
+    if "batch" not in f:
+        parts.append(f"-b {max(FIXED_BATCH, ub)}")
+    parts += [" ".join(shlex.quote(t) for t in g)
+              for g in factor_flags(cfg, f, "server", ub)]
+    if "parallel" not in f and cfg.parallel > 1:
+        parts.append(f"--parallel {cfg.parallel}")
     # Multi-token prediction: if the model ships a NextN/MTP head, enable
     # draft-mtp speculative decoding for extra generation throughput. With the
     # server driver this speedup IS measured; with llama-bench it is NOT (bench
     # can't do speculative decoding) and stacks on top of the reported t/s.
     if cfg.emit_mtp and cfg.hw.get("n_nextn", 0) > 0:
-        n_max = f.get("spec_n_max", str(cfg.spec_draft_n_max))
-        parts.append(f"--spec-type draft-mtp --spec-draft-n-max {n_max}")
-    cmd = " \\\n    ".join(parts)
+        parts.append("--spec-type draft-mtp")
+        if "spec_n_max" not in f:
+            parts.append(f"--spec-draft-n-max {cfg.spec_draft_n_max}")
+    cmd = " \\\n    ".join(["./llama-server"] + parts)
     # prepend any winning env-var factor values as an env prefix
     env_prefix = " ".join(f"{n}={f[n]}" for n in sorted(cfg.env_factor_names) if n in f)
     return (env_prefix + " \\\n  " + cmd) if env_prefix else cmd
@@ -607,10 +671,6 @@ def run_one(cfg: Config, f: dict, timeout: int):
 # Server driver: launch llama-server and drive real generation (measures MTP /
 # speculative decoding and real concurrency, which llama-bench cannot).
 # ---------------------------------------------------------------------------
-# Server-only factors (not llama-bench flags).
-SERVER_ONLY = {"parallel", "spec_n_max"}
-
-
 def _free_port() -> int:
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
@@ -619,27 +679,22 @@ def _free_port() -> int:
 
 def build_server_args(cfg: Config, f: dict, port: int, n_ctx: int) -> list[str]:
     ub = int(f.get("ubatch", 512))
-    batch = int(f.get("batch", FIXED_BATCH))
     args = [
         str(cfg.llama_server), "-m", str(cfg.model),
         "--host", "127.0.0.1", "--port", str(port),
-        "-c", str(n_ctx), "-fa", "1",
-        "-ngl", f["ngl"], "-t", f["threads"],
-        "-ctk", f["kv_type"], "-ctv", f["kv_type"],
-        "-ub", str(ub), "-b", str(max(batch, ub)),
+        "-c", str(n_ctx), "-mmp", str(FIXED_MMAP),
     ]
-    if "ncmoe" in f:
-        args += ["-ncmoe", f["ncmoe"]]
-    if f.get("nkvo") == "1":
-        args += ["-nkvo"]
-    if "poll" in f:
-        args += ["--poll", f["poll"]]
-    par = int(f.get("parallel", cfg.parallel))
-    if par > 1:
-        args += ["--parallel", str(par)]
+    if "fa" not in f:                              # flash-attn fixed unless swept
+        args += ["-fa", str(FIXED_FA)]
+    if "batch" not in f:
+        args += ["-b", str(max(FIXED_BATCH, ub))]
+    args += _flat(factor_flags(cfg, f, "server", ub))
+    if "parallel" not in f and cfg.parallel > 1:   # concurrency (fixed) if not swept
+        args += ["--parallel", str(cfg.parallel)]
     if cfg.emit_mtp and cfg.hw.get("n_nextn", 0) > 0:
-        n_max = f.get("spec_n_max", str(cfg.spec_draft_n_max))
-        args += ["--spec-type", "draft-mtp", "--spec-draft-n-max", n_max]
+        args += ["--spec-type", "draft-mtp"]
+        if "spec_n_max" not in f:                  # default n_max if not swept
+            args += ["--spec-draft-n-max", str(cfg.spec_draft_n_max)]
     return args
 
 
@@ -933,14 +988,16 @@ def refine_factors(cfg: Config, rows: list[dict]) -> dict:
     for name, cur in cfg.factors.items():
         rng, best = ranges[name], bests[name]
         active = len(cur) > 1 and rng >= 0.25 * max_range
+        kind = FACTORS.get(name, {}).get("kind", "cat")
+        numeric = kind == "num" and name not in cfg.env_factor_names
         if not active:
             new[name] = [str(best)]                       # settle at the winner
-        elif name == "kv_type" or name in cfg.env_factor_names:
-            means = factor_level_means(rows, name)         # categorical: keep top few
+        elif numeric:
+            new[name] = refine_numeric([int(x) for x in cur], int(best))  # finer grid
+        else:                                             # cat/float/env: keep top few
+            means = factor_level_means(rows, name)
             ranked = sorted(means, key=means.get, reverse=True)
             new[name] = ranked[:3] if len(ranked) >= 3 else ranked
-        else:
-            new[name] = refine_numeric([int(x) for x in cur], int(best))  # numeric grid
     return new
 
 
@@ -1208,6 +1265,17 @@ def selftest() -> bool:
         ref = refine_factors(cfg_r, rr)
         assert ref["kv_type"] == ["q8_0"]          # flat factor settled at winner
         assert ref["ngl"] == ["40", "45", "50", "55", "60"]  # refined near best (60)
+
+        # unified registry: driver mapping, server-only, -ot translation, bools
+        assert is_server_only("spec_p_min") and not is_server_only("ngl")
+        assert FACTORS["threads_batch"]["bench"] is None      # server-only flag
+        cfg_s = Config(model=Path("m"), llama_bench=Path("b"), array="auto",
+                       ctx_floor=8192, driver="server")
+        assert factor_flags(cfg_s, {"ot": "none"}, "bench", 512) == []   # none omits
+        assert factor_flags(cfg_s, {"ot": "exps_cpu"}, "bench", 512)[0][0] == "-ot"
+        assert factor_flags(cfg_s, {"fa": "0"}, "bench", 512) == [["-fa", "0"]]
+        assert factor_flags(cfg_s, {"nkvo": "1"}, "server", 512) == [["-nkvo"]]  # bare
+        assert factor_flags(cfg_s, {"nkvo": "1"}, "bench", 512) == [["-nkvo", "1"]]
     except AssertionError as e:
         print(f"selftest FAILED: {e}")
         return False
@@ -1444,12 +1512,15 @@ def main():
         name, _, vals = spec.partition("=")
         name = name.strip()
         levels = [v.strip() for v in vals.split(",") if v.strip()]
-        if name not in BENCH_FLAG and name not in SERVER_ONLY:
+        if name not in FACTORS:
             ap.error(f"--factor: unknown factor '{name}' "
-                     f"(sweepable: {sorted(set(BENCH_FLAG) | SERVER_ONLY)})")
-        if name in SERVER_ONLY and cfg.driver != "server":
+                     f"(sweepable: {', '.join(sorted(FACTORS))})")
+        if is_server_only(name) and cfg.driver != "server":
             ap.error(f"--factor {name} requires the server driver "
                      "(--driver server or --profile multi)")
+        if FACTORS[name].get("bench") is None and cfg.driver == "bench":
+            ap.error(f"--factor {name} isn't supported by the bench driver; "
+                     "use --driver server")
         if not levels:
             ap.error(f"--factor {name}: no levels given")
         cfg.factors[name] = levels
