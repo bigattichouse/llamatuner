@@ -1,6 +1,6 @@
 # Design notes & background
 
-Background and prior knowledge behind `llamatune`. The [README](../README.md) covers
+Background and prior knowledge behind `llamatuner`. The [README](../README.md) covers
 usage and the tuning methodology; this document records *why* the factors and levels
 were chosen and the heuristics we're treating as hypotheses to be confirmed by the
 sweep rather than assumed.
@@ -66,7 +66,7 @@ its output with the sampling settings appropriate to your workload.
 Choosing the quant is upstream of this tool, but the intuition that motivated a
 model-agnostic tuner: smaller quants are faster and fit more context, larger quants
 are higher quality. The "sweet spot" (often a mid Q3/Q4/Q5) is exactly the kind of
-thing worth benchmarking per-machine rather than guessing — which is what `llamatune`
+thing worth benchmarking per-machine rather than guessing — which is what `llamatuner`
 automates for the *parameter* axis once a quant is chosen.
 
 | Quant tier | Speed | Quality |

@@ -1361,7 +1361,7 @@ def write_html_report(cfg: Config, rows: list[dict], path: Path):
             f"{cfg.hw.get('vram','?')} MiB VRAM · profile {esc(cfg.profile)} · "
             f"driver {esc(cfg.driver)} · array {esc(cfg.array)}")
     doc = f"""<!doctype html><meta charset=utf-8>
-<title>llamatune — {esc(cfg.model.name)}</title>
+<title>llamatuner — {esc(cfg.model.name)}</title>
 <style>
 :root{{color-scheme:light dark}}
 body{{font:15px/1.5 system-ui,sans-serif;margin:0;padding:24px;max-width:1100px;
@@ -1384,7 +1384,7 @@ th,td{{text-align:left;padding:4px 8px;border-bottom:1px solid #8882;font-varian
 th{{color:#888;font-weight:600}} tr.bad{{opacity:.5}}
 .chart{{max-width:100%;height:auto;display:block;margin:6px 0 18px}}
 </style>
-<h1>llamatune report</h1>
+<h1>llamatuner report</h1>
 <div class=meta>{meta}<br>objective: effective t/s for a {esc(cfg.profile)} request
  ({cfg.n_prompt} prompt + {cfg.n_gen} gen tokens) — {len(ok)}/{len(rows)} configs OK</div>
 <div class=cards>{card('Best', best)}{card(f'Balanced (≥{cfg.ctx_floor})', balanced)}{card('Longest context', longest)}</div>
@@ -1656,7 +1656,7 @@ def run_iterations(args, cfg: Config):
                           for k, v in factors.items()))
         print("#" * 70, flush=True)
         argv = build_child_argv(args, cfg, factors, rp, final)
-        env = {**os.environ, "LLAMATUNE_CHILD": "1"}
+        env = {**os.environ, "LLAMATUNER_CHILD": "1"}
         rc = subprocess.call([sys.executable, os.path.abspath(__file__), *argv], env=env)
         if rc != 0:
             print(f"\npass {p} exited with code {rc}; stopping iteration.")
@@ -2071,7 +2071,7 @@ def main():
 
     # --ctx-scan: probe the physical ceiling first, then make the context axis
     # fractions of it, so the sweep spans the full usable range on THIS hardware.
-    if args.ctx_scan and not os.environ.get("LLAMATUNE_CHILD"):
+    if args.ctx_scan and not (os.environ.get("LLAMATUNER_CHILD") or os.environ.get("LLAMATUNE_CHILD")):
         if not args.run:
             ap.error("--ctx-scan needs --run")
         needed = cfg.llama_server if cfg.driver == "server" else cfg.llama_bench
@@ -2103,13 +2103,13 @@ def main():
 
     # funnel stage 1: Morris pre-screen (reduces cfg.factors to the ones that
     # matter) before the Taguchi sweep / iterate. Runs in the parent, not children.
-    if args.screen and not os.environ.get("LLAMATUNE_CHILD"):
+    if args.screen and not (os.environ.get("LLAMATUNER_CHILD") or os.environ.get("LLAMATUNE_CHILD")):
         if not args.run:
             ap.error("--screen needs --run")
         morris_screen(cfg, args, ap, args.screen)
 
     # iterative refinement: orchestrate N passes as subprocesses of this tool
-    if args.iterate > 1 and not os.environ.get("LLAMATUNE_CHILD"):
+    if args.iterate > 1 and not (os.environ.get("LLAMATUNER_CHILD") or os.environ.get("LLAMATUNE_CHILD")):
         if not args.run:
             ap.error("--iterate needs --run")
         run_iterations(args, cfg)

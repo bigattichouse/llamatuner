@@ -81,7 +81,7 @@ only). Verify the install with no GPU or model via `python3 llamatuner.py --self
 
 The knobs that matter for llama.cpp throughput interact, and testing every
 combination explodes fast. With 5 factors at 5 levels each a full factorial is
-`5^5 = 3125` runs; add a dozen more `--factor`s and it's astronomical. `llamatune`
+`5^5 = 3125` runs; add a dozen more `--factor`s and it's astronomical. `llamatuner`
 replaces the sweep with a **two-stage DOE funnel**, both stages powered by the
 vendored [`robust`](https://github.com/bigattichouse/robust) suite:
 
@@ -549,7 +549,7 @@ See [`docs/DESIGN.md`](docs/DESIGN.md) for the background and tuning hypotheses.
 
 ## License
 
-`llamatune` is released under the [MIT License](LICENSE). The bundled
+`llamatuner` is released under the [MIT License](LICENSE). The bundled
 [`robust`](https://github.com/bigattichouse/robust) DOE suite (the `taguchi/`
 submodule) is dedicated to the public domain under CC0-1.0 — so the whole thing is
 free to use, modify, and redistribute.
