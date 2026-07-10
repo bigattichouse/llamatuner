@@ -427,10 +427,15 @@ python3 llamatuner.py model-UD.gguf --run --driver server \
 
 ## Roadmap / ideas
 
-- **Sobol variance attribution (on a surrogate)** — Sobol needs `N·(k+2)` samples
-  (thousands) to converge, so it can't run on live benchmarks. The plan: fit a cheap
-  surrogate (polynomial/GP/forest) to the runs already collected by Morris + Taguchi,
-  then run Sobol on the *surrogate* (microseconds/eval, free) for first-order and
-  total-order interaction indices. Morris screening (`--screen`) is already done.
+The DOE funnel is feature-complete for tuning: **Morris** screens which knobs matter
+and flags interactions (`σ`), **Taguchi + `--iterate`** find the optimum, and
+**`--confirm`** verifies it. Nothing pressing is planned.
+
+*Considered and dropped:* **Sobol variance attribution.** It would quantify
+interaction strength precisely, but that's diagnostic, not actionable — it never
+changes the deployed config. Morris `σ` already flags interactions cheaply, and the
+confirmation run detects when the additive model breaks. Sobol would also need a
+surrogate over a mixed continuous/categorical space, where a weak fit gives
+confidently-wrong indices. Not worth it.
 
 See [`docs/DESIGN.md`](docs/DESIGN.md) for the background and tuning hypotheses.
