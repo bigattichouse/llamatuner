@@ -154,15 +154,41 @@ Full per-run data is written to `results.csv`.
 
 ---
 
-## Recommended workflow (staged)
+## Recommended workflow (staged / iterative refinement)
 
-1. **Screen** with **L25** (25 runs, ~30–40 min) to see which knobs dominate and get
-   a candidate optimum.
-2. **Refine** the 2–3 dominant factors with **L125** and map the context Pareto finely.
+Rather than one giant sweep, refine in passes — each pass spends its runs where the
+last one showed the most leverage:
+
+1. **Screen** — a quick coarse sweep to rank the knobs:
+   ```bash
+   python3 llamatuner.py model.gguf --run --quick
+   ```
+   Read the **main-effects "impact"** ranking. Factors with a **wide window** (large
+   range) are where the throughput lives — commonly `ngl`, **context** (`n_depth`),
+   and, for MTP models, **`spec_n_max`**. Factors with a tiny range are settled.
+
+2. **Refine** — a focused pass that gives the wide-window factors **more levels** and
+   pins the flat ones at their winner (via `--factor`):
+   ```bash
+   python3 llamatuner.py model.gguf --run --full \
+     --factor ngl=56,58,60,62,64 \
+     --factor n_depth=0,3072,6144,9216,12288 \
+     --factor spec_n_max=1,2,3,4,5 \
+     --factor kv_type=f16,q8_0 --factor threads=8
+   ```
+   More levels on a factor = finer resolution across its window. Repeat, zooming in
+   each time (e.g. once you see `spec_n_max` peaks near 4, sweep `3,4,5,6`).
+
 3. **Confirm** with `--confirm` (or `--full`): the tool runs the predicted-optimal
    config directly and reports predicted-vs-actual — a small gap means the additive
-   model held; a large gap means interactions dominate (trust the Pareto pick).
-   Add `--html report.html` for a visual Pareto + main-effects report.
+   model held; a large gap means interactions (or thermal drift) dominate, so trust
+   the Pareto pick. Add `--html report.html` for a visual report.
+
+**Expanding the array vs. more runs.** More *levels* on the wide-window factors (a
+finer grid) is usually more informative than a bigger array. If you want raw
+statistical power (replication to average out thermal/measurement noise), force a
+larger array like `--array L125` — but that's a 125-run, overnight job. Randomized
+order (default) plus `--full` reps already averages out most drift.
 
 ---
 
