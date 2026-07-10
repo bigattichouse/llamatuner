@@ -20,6 +20,9 @@ python3 llamatuner.py /path/to/model.gguf
 # just tune it — autonomous, one command
 python3 llamatuner.py /path/to/model.gguf --run
 
+# tune for how you actually run it (see "Use cases" below)
+python3 llamatuner.py /path/to/model.gguf --run --use-case agents
+
 # fast screen (1 rep) vs thorough (5 reps + confirm); the array is auto-chosen
 python3 llamatuner.py /path/to/model.gguf --run --quick
 python3 llamatuner.py /path/to/model.gguf --run --full
@@ -65,13 +68,42 @@ estimate that flags when the additive main-effects model is breaking down.
 
 ---
 
-## Workload profiles (`--profile`)
+## Use cases (`--use-case`) — start here
 
-A profile expresses *how you use the model* and sets the representative request
-shape the sweep measures at and optimizes for:
+Most people don't want to think about drivers and concurrency — they know *how
+they run the model*. `--use-case` is a **runbook**: one friendly name that expands
+into the right bundle of lower-level flags (driver + request profile + concurrency).
 
-| Profile | Request (prompt + gen) | Ctx floor | Driver | For |
-|---------|------------------------|-----------|--------|-----|
+| `--use-case` | Driver | Request (prompt + gen) | Streams | For |
+|--------------|--------|------------------------|:-------:|-----|
+| **app** | `llama-bench` | 512 + 256 | 1 | a general/embedded llama.cpp app — raw single-stream throughput |
+| **single** | `llama-server` | 512 + 256 | 1 | llama-server for **one** user/worker (measures MTP too) |
+| **agents** | `llama-server` | 8192 + 256 | 4 | several **autonomous agents** — long tool-use prompts, concurrent |
+| **multi-user** | `llama-server` | 1024 + 256 | 8 | **many concurrent chat users** — short prompts, high concurrency |
+
+```bash
+python3 llamatuner.py model.gguf --run --use-case app          # embedded / CLI app
+python3 llamatuner.py model.gguf --run --use-case single       # one-user server
+python3 llamatuner.py model.gguf --run --use-case agents       # 4 concurrent agents
+python3 llamatuner.py model.gguf --run --use-case multi-user   # 8 concurrent users
+```
+
+**Precedence: built-in defaults < `--use-case` < your explicit flags.** A runbook
+only *fills in* the flags you didn't set, so you can tweak any single dimension
+without abandoning the bundle:
+
+```bash
+# agents runbook, but pin it to 2 streams instead of 4
+python3 llamatuner.py model.gguf --run --use-case agents --parallel 2
+```
+
+### The underlying knobs (`--profile` / `--driver` / `--parallel`)
+
+A use-case is just a named bundle of these; set them directly for full control.
+The **profile** sets the representative request shape the sweep optimizes for:
+
+| `--profile` | Request (prompt + gen) | Ctx floor | Default driver | For |
+|-------------|------------------------|-----------|----------------|-----|
 | **single** (default) | 512 + 256 | 8192 | bench | interactive chat/coding |
 | **agents** | 8192 + 256 | 32768 | bench | big-context tool use / RAG |
 | **multi** | 1024 + 256 | 8192 | server | concurrent serving (`--parallel N`) |
@@ -80,8 +112,8 @@ The objective is **effective throughput** for that request —
 `(P + G) / (P/pp_tps + G/tg_tps)` — which weighs prefill and decode the way the
 workload actually experiences them, instead of optimizing raw decode alone. (A
 nice side effect: it no longer degenerates to "zero context is fastest".)
-Override the shape with `--n-prompt/--n-gen/--ctx-floor`. The `multi` profile
-needs the server driver (roadmap) for real concurrency.
+Override the shape with `--n-prompt/--n-gen/--ctx-floor`, the engine with
+`--driver bench|server`, and concurrency with `--parallel N`.
 
 ## What it measures
 
@@ -256,6 +288,9 @@ order (default) plus `--full` reps already averages out most drift.
 python3 llamatuner.py MODEL.gguf [options]
 
   --run              actually execute the sweep (default: plan/dry-run, no GPU)
+  --use-case U       runbook that bundles driver+profile+concurrency:
+                     app | single | agents | multi-user (see Use cases above).
+                     Explicit flags below override the runbook.
   --profile P        workload profile: single | agents | multi (default: single)
   --thinking         tune for reasoning workloads (long decode, n_gen~2048);
                      default is non-thinking / short answers
@@ -426,8 +461,10 @@ python3 llamatuner.py model-UD.gguf --run --driver server \
   array; generates sensible per-model factor levels. Zero flags required.
 - **Two drivers** — `bench` (fast, raw pp/tg) and `server` (real generation:
   **measures MTP** and **multi-user concurrency**), with server reuse across runs.
-- **Workload profiles** (`--profile single|agents|multi`) + an **effective-throughput**
-  objective that weighs prefill vs decode as the workload experiences them.
+- **Use-case runbooks** (`--use-case app|single|agents|multi-user`) that bundle
+  driver + profile + concurrency, over **workload profiles** (`--profile
+  single|agents|multi`) and an **effective-throughput** objective that weighs
+  prefill vs decode as the workload experiences them.
 - **The funnel** — `--screen` (Morris: rank knobs by μ\*, flag interactions by σ,
   drop the negligible) → `--iterate N` (auto-refine the survivors) → `--confirm`
   (verify the prediction) → `--html` report.

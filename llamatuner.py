@@ -131,6 +131,23 @@ PROFILES = {
                "parallel": 4},
 }
 
+# Use-cases are high-level "runbooks": a friendly name that expands into a bundle
+# of lower-level flags (driver + request profile + concurrency). Precedence is
+# built-in defaults < use-case < explicit flags, so `--use-case agents --parallel 2`
+# keeps the agents runbook but forces 2 streams. Each entry maps to a base profile
+# (request shape / objective) plus the driver and concurrency that fit the workload.
+USE_CASES = {
+    # name          driver     profile    parallel   what it's for
+    "app":        {"driver": "bench",  "profile": "single", "parallel": 1},
+    #   general llama-based app / embedded llama.cpp — raw single-stream throughput
+    "single":     {"driver": "server", "profile": "single", "parallel": 1},
+    #   llama-server for one user/worker — real generation incl. MTP, one slot
+    "agents":     {"driver": "server", "profile": "agents", "parallel": 4},
+    #   several autonomous agents — long tool-use prompts, concurrent slots
+    "multi-user": {"driver": "server", "profile": "multi",  "parallel": 8},
+    #   many concurrent chat users — short prompts, high concurrency
+}
+
 
 # ---------------------------------------------------------------------------
 # Hardware / model auto-detection
@@ -1590,7 +1607,7 @@ def build_child_argv(args, cfg: Config, factors: dict, results_path: Path,
     """One pass's command line for the single-pass tool (explicit everything so
     the child reproduces the resolved config)."""
     argv = [str(args.model), "--run",
-            "--driver", cfg.driver, "--profile", args.profile, "--array", "auto",
+            "--driver", cfg.driver, "--profile", cfg.profile, "--array", "auto",
             "--reps", str(cfg.reps), "--n-prompt", str(cfg.n_prompt),
             "--n-gen", str(cfg.n_gen), "--ctx-floor", str(cfg.ctx_floor),
             "--parallel", str(cfg.parallel), "--timeout", str(args.timeout),
@@ -1825,10 +1842,18 @@ def main():
     ap.add_argument("--env", action="append", default=[], metavar="NAME=v1,v2,...",
                     help="sweep an environment variable as a factor (repeatable), "
                          "e.g. --env GGML_CUDA_FORCE_MMQ=0,1")
-    ap.add_argument("--profile", choices=sorted(PROFILES), default="single",
-                    help="workload profile: single (interactive), agents "
-                         "(big-context tool use), multi (concurrent serving); "
-                         "sets request shape + objective. default: single")
+    ap.add_argument("--use-case", choices=list(USE_CASES), default=None,
+                    metavar="{app,single,agents,multi-user}",
+                    help="high-level runbook that bundles driver+profile+concurrency: "
+                         "app (general/embedded llama.cpp via llama-bench), single "
+                         "(llama-server, one worker/user), agents (several concurrent "
+                         "agents, long tool-use prompts), multi-user (many concurrent "
+                         "chat users). Individual flags below override the runbook.")
+    ap.add_argument("--profile", choices=sorted(PROFILES), default=None,
+                    help="workload profile (request shape + objective): single "
+                         "(interactive), agents (big-context tool use), multi "
+                         "(concurrent serving). Usually set via --use-case; "
+                         "default: single")
     ap.add_argument("--thinking", action="store_true",
                     help="tune for a reasoning/thinking workload — long generations "
                          "(decode-heavy). Sets n_gen to a reasoning length (~2048); "
@@ -1963,15 +1988,20 @@ def main():
         args.ctx_floor = args.ctx_size
         args.max_depth = args.ctx_size
 
-    # resolve request shape from the profile, allowing explicit overrides
-    prof = PROFILES[args.profile]
+    # Resolve the workload with precedence: built-in default < use-case runbook <
+    # explicit flag. The use-case (if any) supplies defaults for profile/driver/
+    # parallel; any flag the user set on the command line still wins.
+    uc = USE_CASES.get(args.use_case) or {}
+    profile = args.profile or uc.get("profile") or "single"
+    prof = PROFILES[profile]
     n_prompt = args.n_prompt if args.n_prompt is not None else prof["n_prompt"]
     # thinking = long reasoning generation (decode-heavy); non-thinking = short
     n_gen = (args.n_gen if args.n_gen is not None
              else 2048 if args.thinking else prof["n_gen"])
     ctx_floor = args.ctx_floor if args.ctx_floor is not None else prof["ctx_floor"]
-    driver = args.driver if args.driver is not None else prof["driver"]
-    parallel = args.parallel if args.parallel is not None else prof.get("parallel", 1)
+    driver = args.driver or uc.get("driver") or prof["driver"]
+    parallel = (args.parallel if args.parallel is not None
+                else uc.get("parallel", prof.get("parallel", 1)))
     reps = args.reps if args.reps is not None else (1 if args.quick else 5 if args.full else BENCH_REPS)
 
     llama_bench = resolve_binary("llama-bench", args.llama_bench, args.llama_cpp)
@@ -1989,7 +2019,7 @@ def main():
         max_depth=args.max_depth,
         emit_mtp=not args.no_mtp,
         spec_draft_n_max=args.spec_draft_n_max,
-        profile=args.profile,
+        profile=profile,
         driver=driver,
         parallel=parallel,
         measure_vram=args.vram,
