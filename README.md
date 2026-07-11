@@ -1,4 +1,4 @@
-# llamatuner
+# llama-optimize
 
 Find good `llama.cpp` command-line parameters for a given GGUF model **on your
 machine**, automatically, using statistically-designed experiments instead of a
@@ -15,20 +15,20 @@ speculative decoding** and **multi-user concurrency** via a server driver, and i
 
 ```bash
 # plan only — prints the experiment matrix and commands, uses NO GPU
-python3 llamatuner.py /path/to/model.gguf
+python3 llama-optimize.py /path/to/model.gguf
 
 # just tune it — autonomous, one command
-python3 llamatuner.py /path/to/model.gguf --run
+python3 llama-optimize.py /path/to/model.gguf --run
 
 # tune for how you actually run it (see "Use cases" below)
-python3 llamatuner.py /path/to/model.gguf --run --use-case agents
+python3 llama-optimize.py /path/to/model.gguf --run --use-case agents
 
 # fast screen (1 rep) vs thorough (5 reps + confirm); the array is auto-chosen
-python3 llamatuner.py /path/to/model.gguf --run --quick
-python3 llamatuner.py /path/to/model.gguf --run --full
+python3 llama-optimize.py /path/to/model.gguf --run --quick
+python3 llama-optimize.py /path/to/model.gguf --run --full
 
 # the full funnel: screen many knobs → refine the few that matter → confirm + report
-python3 llamatuner.py /path/to/model.gguf --run --screen --iterate 3 --html report.html
+python3 llama-optimize.py /path/to/model.gguf --run --screen --iterate 3 --html report.html
 ```
 
 ---
@@ -44,8 +44,8 @@ project (`robust`) that git tracks as a *submodule*: a plain `git clone` leaves 
 
 ```bash
 # if you're cloning fresh, grab the submodule in one step:
-git clone --recurse-submodules https://github.com/bigattichouse/llamatuner
-cd llamatuner
+git clone --recurse-submodules https://github.com/bigattichouse/llama-optimize
+cd llama-optimize
 
 # already cloned (or downloaded a zip) without the submodule? fetch it now:
 git submodule update --init
@@ -61,7 +61,7 @@ make -C taguchi          # builds libtaguchi.so (Taguchi arrays + main-effects)
                          # and the morris binary (for --screen)
 ```
 
-`llamatuner` finds the Taguchi Python binding and the `morris` binary in
+`llama-optimize` finds the Taguchi Python binding and the `morris` binary in
 `taguchi/build/bin/` automatically by searching the submodule — no paths to set.
 
 **3. Point it at your `llama.cpp`.** You need `llama.cpp` built for your GPU
@@ -71,9 +71,9 @@ workspace layout; otherwise pass **`--llama-cpp /path/to/llama.cpp`** (its root 
 `--llama-bench`/`--llama-server` directly. If the binaries can't be found the tool
 stops with a clear error.
 
-**4. Run it** — the commands above (e.g. `python3 llamatuner.py model.gguf --run`).
+**4. Run it** — the commands above (e.g. `python3 llama-optimize.py model.gguf --run`).
 Python 3.10+ is the only other requirement (uses `X | None` syntax, standard library
-only). Verify the install with no GPU or model via `python3 llamatuner.py --selftest`.
+only). Verify the install with no GPU or model via `python3 llama-optimize.py --selftest`.
 
 ---
 
@@ -81,7 +81,7 @@ only). Verify the install with no GPU or model via `python3 llamatuner.py --self
 
 The knobs that matter for llama.cpp throughput interact, and testing every
 combination explodes fast. With 5 factors at 5 levels each a full factorial is
-`5^5 = 3125` runs; add a dozen more `--factor`s and it's astronomical. `llamatuner`
+`5^5 = 3125` runs; add a dozen more `--factor`s and it's astronomical. `llama-optimize`
 replaces the sweep with a **two-stage DOE funnel**, both stages powered by the
 vendored [`robust`](https://github.com/bigattichouse/robust) suite:
 
@@ -154,10 +154,10 @@ into the right bundle of lower-level flags (driver + request profile + concurren
 | **multi-user** | `llama-server` | 1024 + 256 | 8 | **many concurrent chat users** — short prompts, high concurrency |
 
 ```bash
-python3 llamatuner.py model.gguf --run --use-case app          # embedded / CLI app
-python3 llamatuner.py model.gguf --run --use-case single       # one-user server
-python3 llamatuner.py model.gguf --run --use-case agents       # 4 concurrent agents
-python3 llamatuner.py model.gguf --run --use-case multi-user   # 8 concurrent users
+python3 llama-optimize.py model.gguf --run --use-case app          # embedded / CLI app
+python3 llama-optimize.py model.gguf --run --use-case single       # one-user server
+python3 llama-optimize.py model.gguf --run --use-case agents       # 4 concurrent agents
+python3 llama-optimize.py model.gguf --run --use-case multi-user   # 8 concurrent users
 ```
 
 **Precedence: built-in defaults < `--use-case` < your explicit flags.** A runbook
@@ -166,7 +166,7 @@ without abandoning the bundle:
 
 ```bash
 # agents runbook, but pin it to 2 streams instead of 4
-python3 llamatuner.py model.gguf --run --use-case agents --parallel 2
+python3 llama-optimize.py model.gguf --run --use-case agents --parallel 2
 ```
 
 ### The underlying knobs (`--profile` / `--driver` / `--parallel`)
@@ -277,7 +277,7 @@ so it survives a crash — see below).
 **Many knobs? Screen first (the funnel).** With a dozen-plus `--factor`s, run a
 **Morris pre-screen** to find which knobs even matter before spending a full sweep:
 ```bash
-python3 llamatuner.py model.gguf --run --screen --iterate 2 \
+python3 llama-optimize.py model.gguf --run --screen --iterate 2 \
   --factor ngl=0,64 --factor ubatch=128,2048 --factor kv_type=f16,q8_0,q4_0 \
   --factor nkvo=0,1 --factor poll=0,50 --factor ot=none,ffn_cpu
 ```
@@ -297,7 +297,7 @@ Roadmap; Morris `σ` already flags interactions for free.)
 
 **Automatic:** let the tool do the staging for you —
 ```bash
-python3 llamatuner.py model.gguf --run --iterate 3
+python3 llama-optimize.py model.gguf --run --iterate 3
 ```
 `--iterate N` runs N passes: pass 1 screens coarsely, then each pass **settles the
 low-impact factors at their winner and refines the high-impact ones onto a finer
@@ -309,7 +309,7 @@ converge). Each pass writes `results.passN.csv`; the final pass gets `--confirm`
 
 1. **Screen** — a quick coarse sweep to rank the knobs:
    ```bash
-   python3 llamatuner.py model.gguf --run --quick
+   python3 llama-optimize.py model.gguf --run --quick
    ```
    Read the **main-effects "impact"** ranking. Factors with a **wide window** (large
    range) are where the throughput lives — commonly `ngl`, **context** (`n_depth`),
@@ -318,7 +318,7 @@ converge). Each pass writes `results.passN.csv`; the final pass gets `--confirm`
 2. **Refine** — a focused pass that gives the wide-window factors **more levels** and
    pins the flat ones at their winner (via `--factor`):
    ```bash
-   python3 llamatuner.py model.gguf --run --full \
+   python3 llama-optimize.py model.gguf --run --full \
      --factor ngl=56,58,60,62,64 \
      --factor n_depth=0,3072,6144,9216,12288 \
      --factor spec_n_max=1,2,3,4,5 \
@@ -343,7 +343,7 @@ order (default) plus `--full` reps already averages out most drift.
 ## CLI reference
 
 ```
-python3 llamatuner.py MODEL.gguf [options]
+python3 llama-optimize.py MODEL.gguf [options]
 
   --array A          orthogonal array (default: auto-picks the smallest that
                      fits your factors; advanced: force L9/L18/L25/L27/L125/...)
@@ -430,7 +430,7 @@ group, since the fault is in the launch config, not one request.)
 > `--n-prompt/--n-gen`, and `--max-depth` to trade accuracy/coverage for speed on
 > a first pass.
 
-Run `python3 llamatuner.py --selftest` to verify the JSON parser, OOM detection,
+Run `python3 llama-optimize.py --selftest` to verify the JSON parser, OOM detection,
 factor-level generation, MoE detection, and Pareto logic without a GPU or model.
 
 ## Knob reference (one-stop-shop)
@@ -439,7 +439,7 @@ Every tunable the sweep understands. **swept** = in the default design; **opt-in
 = add with `--factor NAME=v1,v2,...`. Any **environment variable** can also be a
 factor via `--env NAME=v1,v2` (applied per process; the winning value is prepended
 to the recommended command). Adding a new knob is one entry in the `FACTORS`
-registry in `llamatuner.py`.
+registry in `llama-optimize.py`.
 
 | knob | flag(s) | driver | kind | when | effect |
 |---|---|---|---|---|---|
@@ -474,15 +474,15 @@ registry in `llamatuner.py`.
 
 ```bash
 # offload placement + CPU polling + KV location
-python3 llamatuner.py model.gguf --run \
+python3 llama-optimize.py model.gguf --run \
   --factor ngl=56,60,64 --factor ot=none,ffn_cpu --factor nkvo=0,1 --factor poll=0,50
 
 # tune the MTP surface (server driver)
-python3 llamatuner.py model-UD.gguf --run --driver server \
+python3 llama-optimize.py model-UD.gguf --run --driver server \
   --factor spec_n_max=2,3,4,5 --factor spec_p_min=0.0,0.1,0.2
 
 # gfx906 / ROCm environment knobs (the "10-30%")
-python3 llamatuner.py model.gguf --run \
+python3 llama-optimize.py model.gguf --run \
   --env GGML_CUDA_FORCE_MMQ=0,1 --env GGML_CUDA_FORCE_CUBLAS=0,1
 ```
 
@@ -509,13 +509,13 @@ finer grid and keeps the top levels of categorical ones.
 
 ```bash
 # measure the real MTP speedup on a single-user workload (UD quant with NextN head)
-python3 llamatuner.py model-UD.gguf --run --driver server
+python3 llama-optimize.py model-UD.gguf --run --driver server
 
 # tune concurrent serving throughput
-python3 llamatuner.py model.gguf --run --profile multi --parallel 8
+python3 llama-optimize.py model.gguf --run --profile multi --parallel 8
 
 # tune the MTP aggressiveness knob directly (server driver only)
-python3 llamatuner.py model-UD.gguf --run --driver server \
+python3 llama-optimize.py model-UD.gguf --run --driver server \
   --array auto --factor spec_n_max=1,2,3,4
 ```
 
@@ -561,7 +561,7 @@ See [`docs/DESIGN.md`](docs/DESIGN.md) for the background and tuning hypotheses.
 
 ## License
 
-`llamatuner` is released under the [MIT License](LICENSE). The bundled
+`llama-optimize` is released under the [MIT License](LICENSE). The bundled
 [`robust`](https://github.com/bigattichouse/robust) DOE suite (the `taguchi/`
 submodule) is dedicated to the public domain under CC0-1.0 — so the whole thing is
 free to use, modify, and redistribute.

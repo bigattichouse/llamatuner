@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-llamatuner - find good llama.cpp command-line parameters for a given GGUF model
+llama-optimize - find good llama.cpp command-line parameters for a given GGUF model
 on this machine, using a Taguchi orthogonal-array sweep over llama-bench.
 
 Usage:
-    llamatuner.py MODEL.gguf                 # plan only: print the matrix + commands
-    llamatuner.py MODEL.gguf --run           # actually run the benchmark sweep
-    llamatuner.py MODEL.gguf --run --array L125   # bigger sweep
+    llama-optimize.py MODEL.gguf                 # plan only: print the matrix + commands
+    llama-optimize.py MODEL.gguf --run           # actually run the benchmark sweep
+    llama-optimize.py MODEL.gguf --run --array L125   # bigger sweep
 
 The tool auto-detects CPU cores, VRAM, and the model's layer count to choose
 sensible factor levels, runs the sweep (one llama-bench invocation per Taguchi
@@ -1547,7 +1547,7 @@ def write_html_report(cfg: Config, rows: list[dict], path: Path):
             f"{cfg.hw.get('vram','?')} MiB VRAM · profile {esc(cfg.profile)} · "
             f"driver {esc(cfg.driver)} · array {esc(cfg.array)}")
     doc = f"""<!doctype html><meta charset=utf-8>
-<title>llamatuner — {esc(cfg.model.name)}</title>
+<title>llama-optimize — {esc(cfg.model.name)}</title>
 <style>
 :root{{color-scheme:light dark}}
 body{{font:15px/1.5 system-ui,sans-serif;margin:0;padding:24px;max-width:1100px;
@@ -1570,7 +1570,7 @@ th,td{{text-align:left;padding:4px 8px;border-bottom:1px solid #8882;font-varian
 th{{color:#888;font-weight:600}} tr.bad{{opacity:.5}}
 .chart{{max-width:100%;height:auto;display:block;margin:6px 0 18px}}
 </style>
-<h1>llamatuner report</h1>
+<h1>llama-optimize report</h1>
 <div class=meta>{meta}<br>objective: effective t/s for a {esc(cfg.profile)} request
  ({cfg.n_prompt} prompt + {cfg.n_gen} gen tokens) — {len(ok)}/{len(rows)} configs OK</div>
 <div class=cards>{card('Fastest (usable)', best)}{card(f'Balanced (≥{cfg.ctx_floor})', balanced)}{card('Max context', longest)}</div>
@@ -1972,7 +1972,7 @@ def run_iterations(args, cfg: Config):
                           for k, v in factors.items()))
         print("#" * 70, flush=True)
         argv = build_child_argv(args, cfg, factors, rp, final)
-        env = {**os.environ, "LLAMATUNER_CHILD": "1"}
+        env = {**os.environ, "LLAMA_OPTIMIZE_CHILD": "1"}
         rc = subprocess.call([sys.executable, os.path.abspath(__file__), *argv], env=env)
         if rc != 0:
             print(f"\npass {p} exited with code {rc}; stopping iteration.")
@@ -2412,7 +2412,7 @@ def main():
 
     # --ctx-scan: probe the physical ceiling first, then make the context axis
     # fractions of it, so the sweep spans the full usable range on THIS hardware.
-    if args.ctx_scan and not (os.environ.get("LLAMATUNER_CHILD") or os.environ.get("LLAMATUNE_CHILD")):
+    if args.ctx_scan and not (os.environ.get("LLAMA_OPTIMIZE_CHILD")):
         if not args.run:
             ap.error("--ctx-scan needs --run")
         needed = cfg.llama_server if cfg.driver == "server" else cfg.llama_bench
@@ -2444,13 +2444,13 @@ def main():
 
     # funnel stage 1: Morris pre-screen (reduces cfg.factors to the ones that
     # matter) before the Taguchi sweep / iterate. Runs in the parent, not children.
-    if args.screen and not (os.environ.get("LLAMATUNER_CHILD") or os.environ.get("LLAMATUNE_CHILD")):
+    if args.screen and not (os.environ.get("LLAMA_OPTIMIZE_CHILD")):
         if not args.run:
             ap.error("--screen needs --run")
         morris_screen(cfg, args, ap, args.screen)
 
     # iterative refinement: orchestrate N passes as subprocesses of this tool
-    if args.iterate > 1 and not (os.environ.get("LLAMATUNER_CHILD") or os.environ.get("LLAMATUNE_CHILD")):
+    if args.iterate > 1 and not (os.environ.get("LLAMA_OPTIMIZE_CHILD")):
         if not args.run:
             ap.error("--iterate needs --run")
         run_iterations(args, cfg)
@@ -2461,7 +2461,7 @@ def main():
         cfg.array = choose_array(cfg.factors) or "auto"
 
     print("=" * 70)
-    print("llamatuner")
+    print("llama-optimize")
     print("=" * 70)
     print(f"model      : {cfg.model.name}")
     arch = meta.get("general.architecture", "?")
