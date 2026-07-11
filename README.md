@@ -3,9 +3,9 @@
 Find good `llama.cpp` command-line parameters for a given GGUF model **on your
 machine**, automatically, using statistically-designed experiments instead of a
 brute-force sweep. Point it at a model; it detects the hardware, runs a small,
-balanced set of benchmarks, and hands you paste-ready commands for the **best**,
-**longest-context**, and **best-balanced** configuration — plus the speed-vs-context
-Pareto frontier. The DOE engines (Taguchi + Morris) come from the
+balanced set of benchmarks, and hands you paste-ready commands for the **fastest
+(usable)**, **balanced**, and **max-context** configuration — plus the
+speed-vs-context Pareto frontier. The DOE engines (Taguchi + Morris) come from the
 [`robust`](https://github.com/bigattichouse/robust) suite, vendored as a submodule.
 
 It works on **AMD (ROCm) or NVIDIA (CUDA)**, tunes **every knob llama.cpp exposes**
@@ -222,7 +222,7 @@ The tool inspects the box and the model so you don't hand-tune the factor levels
 ## Output
 
 ```
-### BEST (max effective t/s)
+### FASTEST (max speed, usable context)
   eff=… t/s  (tg=…  pp=…)  depth=…  ngl=…  t=…  kv=…  ub=…
   suggested llama-server command:
     ./llama-server -m model.gguf -ngl … -t … -c … -ctk … -ctv … -ub … -b 2048 -fa 1
@@ -230,7 +230,7 @@ The tool inspects the box and the model so you don't hand-tune the factor levels
 ### BALANCED (best with context >= …)
   …
 
-### LONGEST CONTEXT
+### MAX CONTEXT
   …
 
 ### Pareto frontier (context vs effective t/s)
@@ -261,10 +261,13 @@ so it survives a crash — see below).
   an error estimate.
 - **Beware thermal drift.** GPUs (notably the MI50) throttle under sustained load,
   so throughput drifts *down* over a long sweep — the same config can measure 40%+
-  slower late in the run than early. To stop that drift from confounding the factor
-  effects, **execution order is randomized by default** (`--seed` to reproduce,
-  `--no-shuffle` to disable). For steadier numbers use `--full` (more reps) and/or
-  `--cooldown` to pause between runs. If `--confirm` reports a large predicted-vs-
+  slower late in the run than early. Two defaults fight it: **execution order is
+  randomized** (`--seed` to reproduce, `--no-shuffle` to disable), and between runs
+  the tool **waits for the GPU to fall back near its idle temperature** (baseline
+  captured once, up front; `--no-thermal-wait` disables it, `--cooldown` is the
+  fixed fallback when no sensor is readable). Each row records its start temp in
+  the CSV (`temp_c`) so you can check comparability afterwards. For steadier
+  numbers use `--full` (more reps). If `--confirm` reports a large predicted-vs-
   actual gap, suspect either interactions *or* thermal drift.
 
 ---
@@ -342,64 +345,71 @@ order (default) plus `--full` reps already averages out most drift.
 ```
 python3 llamatuner.py MODEL.gguf [options]
 
-  --run              actually execute the sweep (default: plan/dry-run, no GPU)
-  --use-case U       runbook that bundles driver+profile+concurrency:
-                     app | single | agents | multi-user (see Use cases above).
-                     Explicit flags below override the runbook.
-  --profile P        workload profile: single | agents | multi (default: single)
-  --thinking         tune for reasoning workloads (long decode, n_gen~2048);
-                     default is non-thinking / short answers
-  --quick            fast screen: 1 rep/config (noisier, ~1/3 the time)
-  --full             thorough: 5 reps/config (steadier, slower)
-  --driver bench|server  benchmark driver (default: from profile). 'server'
-                     measures real generation incl. MTP + concurrency
-  --parallel N       concurrent streams for the server driver
   --array A          orthogonal array (default: auto-picks the smallest that
                      fits your factors; advanced: force L9/L18/L25/L27/L125/...)
-  --min-context N    minimum context you need — BALANCED targets it (alias: --ctx-floor)
-  --max-context N    cap the context axis and the ceiling probe (alias: --max-depth)
+  --confirm          run the predicted-optimal config to verify the additive
+                     model (predicted vs actual; implied by --full)
+  --cooldown SECS    fixed pause between runs so the GPU can cool — the fallback
+                     when no temp sensor is readable (default: 0)
+  --ctx-scan         probe the ceiling FIRST, then set the n_depth axis to fractions
+                     of it (0, ¼, ½, ¾, 0.9×) so the Pareto spans your full range
   --ctx-size N, -c N tune at a FIXED context (like llama.cpp -c) = min==max==N
+  --driver bench|server  benchmark driver (default: from profile). 'server'
+                     measures real generation incl. MTP + concurrency
+  --env NAME=v1,v2,...      sweep an environment variable as a factor (repeatable)
+  --factor NAME=v1,v2,...   sweep/override a knob (repeatable; see Knob reference)
+  --full             thorough: 5 reps/config (steadier, slower)
+  --html PATH        also write a visual HTML report (Pareto + main effects)
+  --iterate N        run N auto-refining passes (screen -> refine -> ...): settle
+                     low-impact factors, refine high-impact ones on a finer grid
+  --llama-bench PATH path to the llama-bench binary
+  --llama-cpp PATH   path to llama.cpp (root or build/bin); also $LLAMA_CPP/$PATH
+  --llama-server PATH  path to the llama-server binary
+  --max-context N    cap the context axis and the ceiling probe (alias: --max-depth)
+  --min-context N    minimum context you need: BALANCED targets it, FASTEST only
+                     considers configs verified to hold it, and emitted -c is
+                     floored at it where the sweep has evidence (alias: --ctx-floor)
+  --min-kv TYPE      KV-cache quality floor (default q8_0, near-lossless); never
+                     recommends a lossier KV. 'any' to explore all (q5/q4)
+  --n-gen N          generated tokens per measurement (default: from profile)
+  --n-prompt N       prompt tokens per measurement (default: from profile)
+  --no-mtp           don't add draft-mtp flags to the server command
   --no-probe         skip the max-context probe (runs by default: binary-searches
                      the physical context ceiling for the furthest-reaching config,
                      then prints a ready command at ~90% of it)
-  --ctx-scan         probe the ceiling FIRST, then set the n_depth axis to fractions
-                     of it (0, ¼, ½, ¾, 0.9×) so the Pareto spans your full range
-  --screen [R]       Morris pre-screen (R trajectories, default 6): rank knobs by
-                     importance, drop the negligible ones, then sweep the rest
-  --iterate N        run N auto-refining passes (screen -> refine -> ...): settle
-                     low-impact factors, refine high-impact ones on a finer grid
-  --confirm          run the predicted-optimal config to verify the additive
-                     model (predicted vs actual; implied by --full)
-  --html PATH        also write a visual HTML report (Pareto + main effects)
-  --vram             measure actual peak VRAM per run (polls rocm-smi/nvidia-smi);
-                     records vram_mib and overlays the VRAM curve + physical
-                     ceiling on the Pareto chart
-  --selftest         run offline logic checks and exit (no GPU, no model)
+  --no-shuffle       run in array order (default: randomized, see below)
+  --no-thermal-wait  disable the default settle between runs (waits until GPU temp
+                     falls back near its idle baseline; keeps runs comparable)
+  --parallel N       concurrent streams for the server driver
+  --profile P        workload profile: single | agents | multi (default: single)
+  --quick            fast screen: 1 rep/config (noisier, ~1/3 the time)
   --reps N           repetitions per config (default: 3, or --quick=1/--full=5)
-  --n-prompt N       prompt tokens per measurement (default: from profile)
-  --n-gen N          generated tokens per measurement (default: from profile)
-  --max-depth N      cap the n_depth factor levels (memory/time budget)
-  --min-kv TYPE      KV-cache quality floor (default q8_0, near-lossless); never
-                     recommends a lossier KV. 'any' to explore all (q5/q4)
-  --factor NAME=v1,v2,...   sweep/override a knob (repeatable; see Knob reference)
-  --env NAME=v1,v2,...      sweep an environment variable as a factor (repeatable)
-  --no-mtp           don't add draft-mtp flags to the server command
-  --spec-draft-n-max N  MTP draft tokens for the server command (default: 2)
-  --llama-bench PATH path to the llama-bench binary
-  --timeout SECS     per-run timeout (default: 1200)
-  --server-start-timeout SECS  give up on a config if llama-server doesn't load
-                     in this long (default: 180; also fails fast if it dies)
-  --results-dir DIR  directory for all output (default: results/, gitignored)
   --results NAME     results CSV name inside --results-dir (default: <model>.csv)
+  --results-dir DIR  directory for all output (default: results/, gitignored)
   --resume           skip runs already in --results (rows save incrementally,
                      so an interrupted sweep can be resumed)
   --retry-crashed    on resume, also retry configs that were started but never
                      finished (suspected crash/hang); default skips them
-  --no-shuffle       run in array order (default: randomized, see below)
+  --run              actually execute the sweep (default: plan/dry-run, no GPU)
+  --screen [R]       Morris pre-screen (R trajectories, default 6): rank knobs by
+                     importance, drop the negligible ones, then sweep the rest
   --seed N           seed the randomized order (reproducibility)
-  --cooldown SECS    pause between runs so the GPU can cool (thermal drift)
-  --llama-cpp PATH   path to llama.cpp (root or build/bin); also $LLAMA_CPP/$PATH
+  --selftest         run offline logic checks and exit (no GPU, no model)
+  --server-start-timeout SECS  give up on a config if llama-server doesn't load
+                     in this long (default: 180; also fails fast if it dies)
+  --spec-draft-n-max N  MTP draft tokens for the server command (default: 2)
+  --thinking         tune for reasoning workloads (long decode, n_gen~2048);
+                     default is non-thinking / short answers
+  --timeout SECS     per-run timeout (default: 1200)
+  --use-case U       runbook that bundles driver+profile+concurrency:
+                     app | single | agents | multi-user (see Use cases above).
+                     --driver/--profile/--parallel override the runbook.
+  --vram             measure actual peak VRAM per run (polls rocm-smi/nvidia-smi);
+                     records vram_mib and overlays the VRAM curve + physical
+                     ceiling on the Pareto chart
 ```
+
+(Flags are listed alphabetically — both here and in `--help`.)
 
 Results are written **incrementally** (one row per run, flushed), so a crash or
 timeout never loses completed runs — rerun with `--resume` to finish the rest.
@@ -527,7 +537,9 @@ python3 llamatuner.py model-UD.gguf --run --driver server \
   including MTP/spec dials, `-ot` placement, CPU affinity, and env vars (`--env`);
   MoE/MTP knobs auto-enabled by model.
 - **Trustworthy measurement** — realistic prompts, warmup + rep averaging,
-  **randomized run order** + `--cooldown` to fight thermal drift.
+  **randomized run order** + a default **thermal settle** between runs (wait for
+  the GPU to return near its idle temp; `--cooldown` as the sensorless fallback),
+  with each row's start temp recorded (`temp_c`).
 - **Robust** — incremental save + `--resume`; **crash journal** so a config that
   reboots the machine is skipped, not retried (`--retry-crashed` to override);
   clear errors; `--selftest` (no GPU); max-context probe by default (`--no-probe` to skip).

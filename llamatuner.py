@@ -232,6 +232,77 @@ def vram_used_mib() -> int | None:
     return None
 
 
+def gpu_temp_c() -> float | None:
+    """Best-effort GPU temperature in °C (AMD rocm-smi then NVIDIA nvidia-smi);
+    None if no sensor is readable. Returns the hottest sensor reported."""
+    try:
+        out = subprocess.run(["rocm-smi", "--showtemp", "--json"],
+                             capture_output=True, text=True, timeout=10)
+        if out.returncode == 0:
+            data = json.loads(out.stdout)
+            edge, any_t = [], []
+            for card in data.values():
+                for k, v in card.items():
+                    if "temp" not in k.lower():
+                        continue
+                    try:
+                        t = float(v)
+                    except (TypeError, ValueError):
+                        continue
+                    any_t.append(t)
+                    if "edge" in k.lower() or "junction" in k.lower():
+                        edge.append(t)
+            temps = edge or any_t
+            if temps:
+                return max(temps)
+    except (OSError, ValueError, json.JSONDecodeError):
+        pass
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=temperature.gpu", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=10)
+        if out.returncode == 0 and out.stdout.strip():
+            return max(float(x) for x in out.stdout.strip().splitlines())
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+# Thermal "wait and watch": between runs, block until the GPU falls back to
+# within THERMAL_BAND_C of the idle baseline so each config is measured from a
+# comparable thermal state (the MI50 throttles ~1.8× cool-vs-hot, a swing bigger
+# than most factor effects — see docs/DESIGN.md). Capped so it can never hang.
+THERMAL_BAND_C = 5.0
+THERMAL_CAP_S = 120.0
+
+
+def wait_until_cool(baseline_c: float | None, band: float = THERMAL_BAND_C,
+                    cap_s: float = THERMAL_CAP_S, poll_s: float = 3.0) -> None:
+    """Watch GPU temperature; return once it is within `band` °C of the idle
+    `baseline_c`, or it plateaus (cooling stalls), or `cap_s` elapses. No-op
+    when there's no baseline or no readable sensor. A *rising* temperature is
+    not a plateau: right after a run the sensor often keeps climbing for a few
+    seconds (heat soak), and bailing then would exit at the hottest moment."""
+    if baseline_c is None:
+        return
+    target, t0, prev = baseline_c + band, time.time(), None
+    tty = sys.stdout.isatty()
+    while time.time() - t0 < cap_s:
+        t = gpu_temp_c()
+        if t is None:
+            break
+        settled = t <= target or (prev is not None and 0 <= prev - t < 0.5)
+        if tty:
+            print(f"\r  thermal: {t:>3.0f}°C  (settle ≤{target:.0f}°C)"
+                  f"{'  ok' if settled else '  cooling…'}   ", end="", flush=True)
+        if settled:
+            break
+        prev = t
+        time.sleep(poll_s)
+    if tty:
+        print()
+
+
 class VRAMSampler:
     """Polls used VRAM in a background thread, tracking the peak during a run.
     (rocm-smi is slow, so polling is coarse; captures the config's footprint.)"""
@@ -512,9 +583,15 @@ def choose_array(factors: dict) -> str | None:
     """Pick the smallest orthogonal array that fits the factor set, based on the
     factors' level counts. Returns an array name, or None to let the binding
     auto-select. Fixes the binding auto-selecting a 5-level array for 3-level
-    factors."""
-    counts = [len(v) for v in factors.values()]
-    if not counts:
+    factors.
+
+    Only factors that actually vary (>1 level) count: a factor refinement has
+    already pinned to a single level is a constant and carries no information
+    for an orthogonal array. Sizing on all factors instead would draw a full
+    25-run L25 to sweep a lone 5-level factor left among four pinned ones. With
+    <=1 varying factor an array is meaningless (return None ⇒ direct sweep)."""
+    counts = [len(v) for v in factors.values() if len(v) > 1]
+    if len(counts) <= 1:
         return None
     nf, mx, n2 = len(counts), max(counts), sum(1 for c in counts if c == 2)
     # one 2-level factor mixed with 3-level factors is the classic L18 case
@@ -533,6 +610,25 @@ def choose_array(factors: dict) -> str | None:
 # Taguchi run generation (via the python binding)
 # ---------------------------------------------------------------------------
 def generate_runs(factors: dict, array: str | None):
+    # Split settled (single-level) factors out of the design. They are constants:
+    # feeding them to the orthogonal array adds no information but inflates the
+    # run count (a lone 5-level factor among four pinned ones would draw a 25-run
+    # L25 — 5 real configs each replicated 5×). Build over the ACTIVE factors and
+    # re-attach the constants to every generated run so downstream command
+    # builders still see a complete factor set.
+    active = {k: v for k, v in factors.items() if len(v) > 1}
+    const = {k: v[0] for k, v in factors.items() if len(v) <= 1}
+
+    if len(active) <= 1:
+        # 0 or 1 varying factor: an orthogonal array is degenerate — enumerate
+        # the level(s) directly (a one-way sweep), no wasted replicate rows and
+        # no dependency on the array binding.
+        if not active:
+            return None, [{"run_id": 1, "factors": dict(const)}]
+        (name, levels), = active.items()
+        return None, [{"run_id": i + 1, "factors": {**const, name: lvl}}
+                      for i, lvl in enumerate(levels)]
+
     sys.path.insert(0, str(find_taguchi_binding()))
     from taguchi import Experiment  # noqa: E402
 
@@ -540,9 +636,11 @@ def generate_runs(factors: dict, array: str | None):
         array = None
     # The binding takes the array in the constructor; None => auto-select.
     exp = Experiment(array_type=array)
-    for name, levels in factors.items():
+    for name, levels in active.items():
         exp.add_factor(name, levels)
     runs = exp.generate()
+    for run in runs:                       # constants ride along on every row
+        run["factors"].update(const)
     return exp, runs
 
 
@@ -1068,6 +1166,99 @@ def pareto_frontier(rows: list[dict]) -> list[dict]:
     return sorted(frontier, key=lambda r: int(r["n_depth"]))
 
 
+def verified_depth_of(cfg: Config, rows: list[dict], r: dict) -> int:
+    """Deepest n_depth among OK rows sharing r's launch factors (everything but
+    n_depth) — the most context this exact config is *known* to load. With the
+    server driver those siblings shared one session sized at the group's max
+    depth; with bench they each loaded at least their own depth."""
+    def key(row):
+        return tuple(str(row.get(k)) for k in cfg.factors if k != "n_depth")
+    mine = key(r)
+    ds = [int(o["n_depth"]) for o in rows
+          if o.get("status") == "OK" and key(o) == mine]
+    return max(ds, default=int(r["n_depth"]))
+
+
+def recommended_ctx(cfg: Config, r: dict, verified_depth: int | None = None) -> int:
+    """Context (`-c`) to emit for a winning row.
+
+    Base: the footprint the sweep actually verified for this row — the server
+    driver sizes its session at ``n_prompt + n_depth + n_gen + 256`` (times
+    ``--parallel``) in ``server_run_one`` — rounded *down* to a tidy multiple;
+    rounding up would inflate the KV cache past the verified point and can OOM
+    at launch.
+
+    Floor: a server with a tiny context isn't worth pasting (a depth-0 winner
+    would emit ``-c 1024``), so the result is raised to at least ``ctx_floor``
+    per slot — but never past the footprint of ``verified_depth`` (the deepest
+    this launch config measured OK; see ``verified_depth_of``). The floor rides
+    on evidence, it never outruns it: with no deeper sibling this returns the
+    row's own verified footprint unchanged.
+    """
+    par = max(1, int(r.get("parallel", cfg.parallel)))
+
+    def footprint(d: int) -> int:
+        v = cfg.n_prompt + d + cfg.n_gen + 256
+        return v * par if par > 1 else v
+
+    d = int(r["n_depth"])
+    want = max(footprint(d), cfg.ctx_floor * par)
+    cap = footprint(d if verified_depth is None else max(d, verified_depth))
+    return max(256, (min(want, cap) // 256) * 256)
+
+
+def ctx_floor_note(cfg: Config, r: dict, ctx: int) -> str | None:
+    """One-line note when the emitted -c had to stay below the usable floor
+    because the sweep holds no deeper evidence for this config."""
+    par = max(1, int(r.get("parallel", cfg.parallel)))
+    if ctx >= (cfg.ctx_floor * par) // 256 * 256:
+        return None
+    return (f"note: -c {ctx} is below the {cfg.ctx_floor} usable-context floor — "
+            "the sweep never verified this config any deeper.")
+
+
+def pick_recommendations(cfg: Config, rows: list[dict]):
+    """The report's three picks: (fastest, balanced, longest).
+
+    FASTEST means fastest *usable* — best score among configs whose emitted
+    command can hold the usable-context floor (verified evidence, not hope) —
+    so the headline is never a config that only shines with an empty KV cache.
+    Falls back to the raw fastest when nothing meets the floor (e.g. a model
+    whose native context is below it); the floor note flags that. BALANCED is
+    the best score *measured at* depth >= the floor (speed while actually deep
+    in context); LONGEST is the deepest OK row.
+    """
+    ok = [r for r in rows if r["status"] == "OK"]
+    if not ok:
+        return None, None, None
+
+    def holds_floor(r):
+        ctx = recommended_ctx(cfg, r, verified_depth_of(cfg, rows, r))
+        return ctx_floor_note(cfg, r, ctx) is None
+
+    pool = [r for r in ok if holds_floor(r)]
+    fastest = max(pool or ok, key=score_of)
+    deep = [r for r in ok if int(r["n_depth"]) >= cfg.ctx_floor]
+    balanced = max(deep, key=score_of) if deep else None
+    longest = max(ok, key=lambda r: (int(r["n_depth"]), score_of(r)))
+    return fastest, balanced, longest
+
+
+def kv_downgrade_hint(r: dict) -> str | None:
+    """One-line `q8_0` suggestion for rows whose KV cache is heavier than the
+    near-lossless `q8_0` floor (i.e. `f32`/`f16`/`bf16`). q8_0 ~halves the KV
+    footprint per token for roughly double the context in the same VRAM, so it
+    is the cheapest lever back from a memory cliff — surfaced at copy-paste time
+    rather than discovered by an OOM. Returns None when nothing is to be gained
+    (KV already q8_0 or lossier)."""
+    kv = str(r.get("kv_type", ""))
+    if kv not in KV_QUALITY or KV_QUALITY.index(kv) >= KV_QUALITY.index("q8_0"):
+        return None
+    return ("tip: KV cache is " + kv + " — set -ctk q8_0 -ctv q8_0 to ~halve KV "
+            "memory (near-lossless) for roughly double the context / more OOM "
+            "headroom, at a small decode-speed cost.")
+
+
 def report(cfg: Config, rows: list[dict]):
     ok = [r for r in rows if r["status"] == "OK"]
     print("\n" + "=" * 70)
@@ -1093,10 +1284,7 @@ def report(cfg: Config, rows: list[dict]):
     print(f"objective  : effective t/s for a {cfg.profile} request "
           f"({cfg.n_prompt} prompt + {cfg.n_gen} gen tokens)")
 
-    fastest = max(ok, key=score_of)
-    usable = [r for r in ok if int(r["n_depth"]) >= cfg.ctx_floor]
-    longest = max(ok, key=lambda r: (int(r["n_depth"]), score_of(r)))
-    balanced = max(usable, key=score_of) if usable else None
+    fastest, balanced, longest = pick_recommendations(cfg, rows)
 
     def show(title, r):
         if not r:
@@ -1106,17 +1294,19 @@ def report(cfg: Config, rows: list[dict]):
         print(f"  eff={score_of(r):.1f} t/s  (tg={r['tg_tps']:.1f}  "
               f"pp={r['pp_tps']:.1f})  depth={r['n_depth']}  ngl={r['ngl']}  "
               f"t={r['threads']}  kv={r['kv_type']}  ub={r['ubatch']}")
-        # size context to cover the measured depth + a floor, rounded up to a
-        # tidy power of two
-        need = max(int(r["n_depth"]) + cfg.n_prompt + cfg.n_gen,
-                   cfg.ctx_floor, 4096)
-        ctx = 1 << (need - 1).bit_length()
+        # size context to what the sweep verified for this config, floored at
+        # the usable floor where evidence allows (see recommended_ctx); a
+        # bigger -c can OOM at launch.
+        ctx = recommended_ctx(cfg, r, verified_depth_of(cfg, rows, r))
         print("  suggested llama-server command:")
         print("    " + server_command(cfg, r, ctx))
+        for extra in (kv_downgrade_hint(r), ctx_floor_note(cfg, r, ctx)):
+            if extra:
+                print("  " + extra)
 
-    show("BEST (max effective t/s)", fastest)
+    show("FASTEST (max speed, usable context)", fastest)
     show(f"BALANCED (best with context >= {cfg.ctx_floor})", balanced)
-    show("LONGEST CONTEXT", longest)
+    show("MAX CONTEXT", longest)
 
     print("\n### Pareto frontier (context vs effective t/s)")
     for r in pareto_frontier(rows):
@@ -1171,6 +1361,13 @@ def refine_factors(cfg: Config, rows: list[dict]) -> dict:
 
     new = {}
     for name, cur in cfg.factors.items():
+        # n_depth is the report's tradeoff axis (speed vs context), not a knob to
+        # optimize to one value. Keep its full spread across passes so the final
+        # pass still maps the whole curve — otherwise FASTEST/BALANCED/MAX-CONTEXT
+        # collapse to a single depth and the three recommendations become identical.
+        if name == "n_depth":
+            new[name] = cur
+            continue
         rng, best = ranges[name], bests[name]
         active = len(cur) > 1 and rng >= 0.25 * max_range
         kind = FACTORS.get(name, {}).get("kind", "cat")
@@ -1184,20 +1381,6 @@ def refine_factors(cfg: Config, rows: list[dict]) -> dict:
             ranked = sorted(means, key=means.get, reverse=True)
             new[name] = ranked[:3] if len(ranked) >= 3 else ranked
     return new
-
-
-def _nice_ticks(vmax: float, n: int = 4) -> list:
-    import math
-    if vmax <= 0:
-        return [0]
-    step = vmax / n
-    mag = 10 ** math.floor(math.log10(step))
-    for m in (1, 2, 2.5, 5, 10):
-        if step <= m * mag:
-            step = m * mag
-            break
-    k = int(vmax / step) + 1
-    return [step * i for i in range(k + 1)]
 
 
 def _svg_pareto(rows: list[dict], vram_total: float = 0) -> str:
@@ -1215,7 +1398,13 @@ def _svg_pareto(rows: list[dict], vram_total: float = 0) -> str:
     have_vram = len(vpts) >= 2
     W, H, ml, mt, mb = 680, 340, 62, 14, 46
     mr = 58 if have_vram else 16
-    xmax = max((x for x, _ in pts), default=1) or 1
+    # zoom the x-axis to the data range too (same treatment as y below, clamped
+    # at 0 since negative context is meaningless): fixed 0..max scaling stacked
+    # every point of a single-depth run on the right edge, and rounded-up ticks
+    # could land outside the viewBox.
+    xs = [x for x, _ in pts]
+    xpad = (max(xs) - min(xs)) * 0.1 or max(max(xs) * 0.05, 1)
+    xlo, xhi = max(0, min(xs) - xpad), max(xs) + xpad
     ys = [y for _, y in pts]
     # zoom the left y-axis to 10% of the data *range* beyond each end (NOT 10% of the
     # value, and NOT from 0) so the actual variation fills ~80% of the height —
@@ -1228,7 +1417,7 @@ def _svg_pareto(rows: list[dict], vram_total: float = 0) -> str:
     vhi = max([v for _, v in vpts] + [vram_total]) * 1.05 if have_vram else 1
 
     def sx(x):
-        return ml + (x / xmax) * (W - ml - mr)
+        return ml + ((x - xlo) / (xhi - xlo)) * (W - ml - mr)
 
     def sy(y):
         return H - mb - ((y - ylo) / (yhi - ylo)) * (H - mt - mb)
@@ -1237,7 +1426,8 @@ def _svg_pareto(rows: list[dict], vram_total: float = 0) -> str:
         return H - mb - (v / vhi) * (H - mt - mb)
 
     g = []
-    for x in _nice_ticks(xmax):
+    for i in range(5):                       # 5 ticks across the zoomed x-range
+        x = xlo + (xhi - xlo) * i / 4
         gx = sx(x)
         g.append(f"<line x1='{gx:.0f}' y1='{mt}' x2='{gx:.0f}' y2='{H - mb}' class='grid'/>")
         g.append(f"<text x='{gx:.0f}' y='{H - mb + 16}' class='ax xt'>{int(x)}</text>")
@@ -1296,26 +1486,22 @@ def write_html_report(cfg: Config, rows: list[dict], path: Path):
         return _html.escape(str(x))
 
     ok = [r for r in rows if r["status"] == "OK"]
-    best = max(ok, key=score_of) if ok else None
-    usable = [r for r in ok if int(r["n_depth"]) >= cfg.ctx_floor]
-    balanced = max(usable, key=score_of) if usable else None
-    longest = max(ok, key=lambda r: (int(r["n_depth"]), score_of(r))) if ok else None
+    best, balanced, longest = pick_recommendations(cfg, rows)
     pareto = pareto_frontier(rows)
-
-    def ctx_for(r):
-        need = max(int(r["n_depth"]) + cfg.n_prompt + cfg.n_gen, cfg.ctx_floor, 4096)
-        return 1 << (need - 1).bit_length()
 
     def card(title, r):
         if not r:
             return f"<div class=card><h3>{esc(title)}</h3><p class=muted>none met the constraint</p></div>"
-        cmd = esc(server_command(cfg, r, ctx_for(r)))
+        ctx = recommended_ctx(cfg, r, verified_depth_of(cfg, rows, r))
+        cmd = esc(server_command(cfg, r, ctx))
+        tip = "".join(f"<div class=muted>{esc(x)}</div>"
+                      for x in (kv_downgrade_hint(r), ctx_floor_note(cfg, r, ctx)) if x)
         return (f"<div class=card><h3>{esc(title)}</h3>"
                 f"<div class=big>{score_of(r):.1f} <span class=unit>eff t/s</span></div>"
                 f"<div class=muted>tg {r['tg_tps']:.1f} · pp {r['pp_tps']:.1f} · "
                 f"depth {esc(r['n_depth'])} · ngl {esc(r['ngl'])} · kv {esc(r['kv_type'])} · "
                 f"ub {esc(r['ubatch'])} · t {esc(r['threads'])}</div>"
-                f"<pre>{cmd}</pre></div>")
+                f"<pre>{cmd}</pre>{tip}</div>")
 
     # main-effects bars, factors ordered by range (impact) descending
     effects = []
@@ -1387,7 +1573,7 @@ th{{color:#888;font-weight:600}} tr.bad{{opacity:.5}}
 <h1>llamatuner report</h1>
 <div class=meta>{meta}<br>objective: effective t/s for a {esc(cfg.profile)} request
  ({cfg.n_prompt} prompt + {cfg.n_gen} gen tokens) — {len(ok)}/{len(rows)} configs OK</div>
-<div class=cards>{card('Best', best)}{card(f'Balanced (≥{cfg.ctx_floor})', balanced)}{card('Longest context', longest)}</div>
+<div class=cards>{card('Fastest (usable)', best)}{card(f'Balanced (≥{cfg.ctx_floor})', balanced)}{card('Max context', longest)}</div>
 <h2>What matters (main effects, by impact)</h2>{''.join(fx_html)}
 <h2>Pareto frontier (context vs effective t/s)</h2>
 {_svg_pareto(rows, cfg.hw.get("vram", 0) if cfg.measure_vram else 0)}
@@ -1401,6 +1587,12 @@ th{{color:#888;font-weight:600}} tr.bad{{opacity:.5}}
 def taguchi_effects(exp, rows: list[dict]):
     """Main-effects on the objective. Returns (optimal_levels, predicted_score)
     or (None, None)."""
+    if exp is None:
+        # direct one-way sweep: no array to analyze (and nothing to confirm —
+        # every level was measured directly; the rows ARE the answer)
+        print("\n(direct sweep: main-effects analysis and confirmation don't "
+              "apply — every level was measured directly)")
+        return None, None
     try:
         from taguchi import Analyzer
     except Exception:
@@ -1443,12 +1635,14 @@ def taguchi_effects(exp, rows: list[dict]):
 # ---------------------------------------------------------------------------
 # Stage-2: max-context probe
 # ---------------------------------------------------------------------------
-def probe_max_context(cfg: Config, base_f: dict, timeout: int, cap: int):
+def probe_max_context(cfg: Config, base_f: dict, timeout: int, cap: int,
+                      baseline_c: float | None = None):
     """Binary-search the largest n_depth that loads (no OOM) for base_f.
 
     Returns (max_depth, tg_tps_at_max) or None if even depth 0 fails.
     """
     def try_depth(d):
+        wait_until_cool(baseline_c)   # each attempt measures; keep it comparable
         f = dict(base_f)
         f["n_depth"] = str(d)
         r = drive_one(cfg, f, timeout)
@@ -1511,6 +1705,21 @@ def selftest() -> bool:
         depths = sorted(int(r["n_depth"]) for r in pareto_frontier(rows))
         assert depths == [0, 16384], depths
 
+        # pareto SVG: x-axis zooms to the data range (like y) — a single-depth
+        # run must not stack every point on the right edge (regression: a final
+        # refinement pass at one depth drew all 25 dots at x=right-margin), and
+        # every tick must land on-plot (rounding ticks up past xmax drew them
+        # outside the viewBox).
+        svg1 = _svg_pareto([{"status": "OK", "n_depth": "49152", "tg_tps": t}
+                            for t in (10.0, 12.0, 14.0)])
+        cxs = [float(m) for m in re.findall(r"circle cx='([\d.]+)'", svg1)]
+        assert cxs and all(200 < c < 500 for c in cxs), cxs   # centered, not edge
+        svg2 = _svg_pareto([{"status": "OK", "n_depth": d, "tg_tps": t} for d, t in
+                            [("0", 50.0), ("16384", 40.0), ("65536", 20.0)]])
+        ticks = [float(m) for m in
+                 re.findall(r"<text x='([\d.-]+)' y='\d+' class='ax xt'", svg2)]
+        assert ticks and all(62 <= t <= 664 for t in ticks), ticks  # on-plot
+
         # command builder: flag map, env split, batch clamp
         cfg = Config(model=Path("m.gguf"), llama_bench=Path("lb"), array="L25",
                      ctx_floor=16384, env_factor_names={"GGML_CUDA_FORCE_MMQ"})
@@ -1530,6 +1739,83 @@ def selftest() -> bool:
                    - 768 / (512 / 1000 + 256 / 100)) < 1e-6
         assert set(PROFILES) == {"single", "agents", "multi"}
 
+        # recommended -c never exceeds the verified footprint (regression:
+        # a row measured at depth 49152 must NOT be emitted as -c 65536).
+        cfgc = Config(model=Path("m.gguf"), llama_bench=Path("lb"), array="L25",
+                      n_prompt=512, n_gen=256, ctx_floor=8192)
+        assert recommended_ctx(cfgc, {"n_depth": "49152"}) == 50176
+        for d in (0, 4096, 49152, 131072):
+            ctx = recommended_ctx(cfgc, {"n_depth": str(d)})
+            assert ctx <= cfgc.n_prompt + d + cfgc.n_gen + 256      # not inflated
+            assert ctx >= d + cfgc.n_prompt + cfgc.n_gen            # covers request
+            assert ctx % 256 == 0
+        # parallel multiplies the verified session context
+        cfgp = Config(model=Path("m.gguf"), llama_bench=Path("lb"), array="L25",
+                      ctx_floor=8192, n_prompt=512, n_gen=256, parallel=4)
+        assert recommended_ctx(cfgp, {"n_depth": "8192"}) == (512 + 8192 + 256 + 256) * 4
+
+        # usable floor on the emitted -c: raised to ctx_floor when (and only as
+        # far as) a sibling verified deeper; explicit lower floors are honored;
+        # with no deeper evidence the row's own footprint stands, plus a note.
+        assert recommended_ctx(cfgc, {"n_depth": "0"}, verified_depth=49152) == 8192
+        assert recommended_ctx(cfgc, {"n_depth": "0"}, verified_depth=4096) == 5120
+        assert recommended_ctx(cfgc, {"n_depth": "0"}) == 1024
+        cfg_lo = Config(model=Path("m.gguf"), llama_bench=Path("lb"), array="L25",
+                        n_prompt=512, n_gen=256, ctx_floor=2048)
+        assert recommended_ctx(cfg_lo, {"n_depth": "0"}, verified_depth=49152) == 2048
+        assert ctx_floor_note(cfgc, {"n_depth": "0"}, 1024)           # capped => note
+        assert ctx_floor_note(cfgc, {"n_depth": "0"}, 8192) is None   # floor met
+
+        # verified_depth_of: deepest OK sibling sharing the launch factors
+        cfg_v = Config(model=Path("m"), llama_bench=Path("b"), array="auto",
+                       ctx_floor=8192)
+        cfg_v.factors = {"ngl": ["60", "99"], "n_depth": ["0", "16384", "49152"]}
+        rows_v = [{"status": "OK", "ngl": "60", "n_depth": "0", "eff_tps": 40.},
+                  {"status": "OK", "ngl": "60", "n_depth": "49152", "eff_tps": 30.},
+                  {"status": "OOM", "ngl": "60", "n_depth": "16384", "eff_tps": 0.},
+                  {"status": "OK", "ngl": "99", "n_depth": "0", "eff_tps": 50.}]
+        assert verified_depth_of(cfg_v, rows_v, rows_v[0]) == 49152
+        assert verified_depth_of(cfg_v, rows_v, rows_v[3]) == 0   # no deep sibling
+
+        # FASTEST = fastest *usable*: the raw-fastest config (ngl 99, never
+        # verified past depth 0) is skipped for the fastest one that holds the
+        # floor — no bench-number chasing; falls back when nothing qualifies.
+        fast, bal, lng = pick_recommendations(cfg_v, rows_v)
+        assert fast is rows_v[0] and bal is rows_v[1] and lng is rows_v[1]
+        f2, b2, _ = pick_recommendations(cfg_v, [rows_v[3]])
+        assert f2 is rows_v[3] and b2 is None
+        assert pick_recommendations(cfg_v, []) == (None, None, None)
+
+        # thermal wait-and-watch: no baseline => immediate no-op (never blocks)
+        assert wait_until_cool(None) is None
+        # a RISING temperature (post-run heat soak) is not a plateau (regression:
+        # `prev - t < 0.5` was true for negatives, exiting at the hottest moment);
+        # a genuine stall (cooling < 0.5°C/poll) or reaching baseline+band settles.
+        import contextlib
+        import io
+        real_temp, calls = gpu_temp_c, []
+
+        def fake_temp(seq):
+            it = iter(seq)
+            return lambda: (calls.append(1), next(it, seq[-1]))[1]
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                globals()["gpu_temp_c"] = fake_temp([60.0, 62.0, 61.9, 55.0])
+                wait_until_cool(40.0, band=5.0, cap_s=99, poll_s=0)
+                assert len(calls) == 3   # rode out the rise; exited on the stall
+                calls.clear()
+                globals()["gpu_temp_c"] = fake_temp([60.0, 50.0, 44.0])
+                wait_until_cool(40.0, band=5.0, cap_s=99, poll_s=0)
+                assert len(calls) == 3   # cooled to <= baseline+band and settled
+        finally:
+            globals()["gpu_temp_c"] = real_temp
+
+        # q8_0 downgrade hint fires only for KV heavier than the q8_0 floor
+        assert kv_downgrade_hint({"kv_type": "f16"})
+        assert kv_downgrade_hint({"kv_type": "f32"})
+        assert kv_downgrade_hint({"kv_type": "q8_0"}) is None
+        assert kv_downgrade_hint({"kv_type": "q4_0"}) is None
+
         # realistic prompt: varied text of ~n*4 chars, not a repeated token
         assert len(_realistic_prompt(100)) == 400
         assert len(set(_realistic_prompt(200))) > 20  # genuinely varied
@@ -1543,6 +1829,22 @@ def selftest() -> bool:
         # a fixed (1-level) factor among 3-level ones still picks a 3-level array
         assert choose_array({"t": ["8"], "a": ["1", "2", "3"],
                              "b": ["1", "2", "3"]}) == "L9"
+        # settled constants don't count: one lone varying factor => no array
+        # (direct sweep), not a 25-run L25 to replicate 5 configs 5×.
+        assert choose_array({"ngl": ["56", "57", "58", "59", "60"],
+                             "d": ["49152"], "t": ["8"], "kv": ["f16"]}) is None
+        assert choose_array({}) is None
+
+        # generate_runs: <=1 active factor enumerates directly (N runs, not N×N),
+        # constants attached to every row; needs no array binding.
+        exp0, runs0 = generate_runs({"ngl": ["56", "58", "60"], "d": ["49152"],
+                                     "kv": ["f16"]}, "auto")
+        assert exp0 is None and len(runs0) == 3            # one run per ngl level
+        assert all(r["factors"]["d"] == "49152" and r["factors"]["kv"] == "f16"
+                   for r in runs0)                         # constants ride along
+        assert [r["factors"]["ngl"] for r in runs0] == ["56", "58", "60"]
+        _, runs1 = generate_runs({"ngl": ["60"], "kv": ["f16"]}, "auto")
+        assert len(runs1) == 1                             # 0 active => single config
 
         # refinement: settle the flat factor, refine the high-impact one
         assert refine_numeric([20, 40, 60], 60) == ["40", "45", "50", "55", "60"]
@@ -1555,6 +1857,16 @@ def selftest() -> bool:
         ref = refine_factors(cfg_r, rr)
         assert ref["kv_type"] == ["q8_0"]          # flat factor settled at winner
         assert ref["ngl"] == ["40", "45", "50", "55", "60"]  # refined near best (60)
+        # n_depth is the tradeoff axis: kept spread across passes, never settled,
+        # so the final pass still maps the whole speed/context curve.
+        cfg_d = Config(model=Path("m"), llama_bench=Path("b"), array="auto",
+                       ctx_floor=8192)
+        cfg_d.factors = {"ngl": ["20", "40", "60"],
+                         "n_depth": ["0", "16384", "32768", "49152", "65536"]}
+        rd = [{"status": "OK", "ngl": "60", "n_depth": d, "eff_tps": e}
+              for d, e in [("0", 30.), ("16384", 25.), ("32768", 20.),
+                           ("49152", 15.), ("65536", 10.)]]
+        assert refine_factors(cfg_d, rd)["n_depth"] == cfg_d.factors["n_depth"]
 
         # unified registry: driver mapping, server-only, -ot translation, bools
         assert is_server_only("spec_p_min") and not is_server_only("ngl")
@@ -1623,6 +1935,10 @@ def build_child_argv(args, cfg: Config, factors: dict, results_path: Path,
         argv.append("--vram")
     if args.no_shuffle:
         argv.append("--no-shuffle")
+    if args.no_thermal_wait:
+        argv.append("--no-thermal-wait")
+    if args.thermal_baseline is not None:      # children reuse the parent's idle
+        argv += ["--thermal-baseline", str(args.thermal_baseline)]
     if args.seed is not None:
         argv += ["--seed", str(args.seed)]
     if args.max_depth is not None:
@@ -1782,6 +2098,12 @@ def morris_screen(cfg: Config, args, ap, trajectories: int):
                 status = res["status"]
                 cache[ckey] = eff
                 print(f"{prefix} -> {status} eff={eff:.1f} t/s", flush=True)
+                # the screen decides which knobs get DROPPED — settle it like
+                # the sweep so drift doesn't rank the factors
+                if args.thermal_baseline is not None:
+                    wait_until_cool(args.thermal_baseline)
+                elif args.cooldown > 0:
+                    time.sleep(args.cooldown)
             rows.append({"status": "OK" if eff > 0 else status, "eff_tps": eff, **f})
             w.writerow([rid, f"{eff:.4f}"])
             fh.flush()
@@ -1826,130 +2148,141 @@ def morris_screen(cfg: Config, args, ap, trajectories: int):
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
+    # flags alphabetized (keep it that way when adding one)
     ap.add_argument("model", type=Path, nargs="?", help="path to the GGUF model")
-    ap.add_argument("--run", action="store_true",
-                    help="actually execute the benchmark sweep (uses the GPU)")
-    ap.add_argument("--quick", action="store_true",
-                    help="fast screen: 1 rep per config (noisier, ~1/3 the time)")
-    ap.add_argument("--full", action="store_true",
-                    help="thorough: 5 reps per config (steadier numbers, slower)")
     ap.add_argument("--array", default="auto",
                     help="orthogonal array; default 'auto' picks the smallest that "
                          "fits your factors. Advanced: force L9/L18/L25/L27/L125/...")
-    ap.add_argument("--factor", action="append", default=[], metavar="NAME=v1,v2,...",
-                    help="override/add a sweepable factor (repeatable), e.g. "
-                         "--factor ngl=56,60,64 --factor nkvo=0,1 --factor poll=0,50")
-    ap.add_argument("--env", action="append", default=[], metavar="NAME=v1,v2,...",
-                    help="sweep an environment variable as a factor (repeatable), "
-                         "e.g. --env GGML_CUDA_FORCE_MMQ=0,1")
-    ap.add_argument("--use-case", choices=list(USE_CASES), default=None,
-                    metavar="{app,single,agents,multi-user}",
-                    help="high-level runbook that bundles driver+profile+concurrency: "
-                         "app (general/embedded llama.cpp via llama-bench), single "
-                         "(llama-server, one worker/user), agents (several concurrent "
-                         "agents, long tool-use prompts), multi-user (many concurrent "
-                         "chat users). Individual flags below override the runbook.")
-    ap.add_argument("--profile", choices=sorted(PROFILES), default=None,
-                    help="workload profile (request shape + objective): single "
-                         "(interactive), agents (big-context tool use), multi "
-                         "(concurrent serving). Usually set via --use-case; "
-                         "default: single")
-    ap.add_argument("--thinking", action="store_true",
-                    help="tune for a reasoning/thinking workload — long generations "
-                         "(decode-heavy). Sets n_gen to a reasoning length (~2048); "
-                         "default (no flag) is non-thinking / short answers")
+    ap.add_argument("--confirm", action="store_true",
+                    help="after the sweep, run the predicted-optimal config to "
+                         "verify the model's prediction (implied by --full)")
+    ap.add_argument("--cooldown", type=float, default=0,
+                    help="fixed seconds to pause between runs so the GPU can cool "
+                         "(fallback when no temp sensor; default 0)")
+    ap.add_argument("--ctx-scan", action="store_true",
+                    help="probe the physical context ceiling FIRST, then set the "
+                         "n_depth axis to fractions of it (0, ¼, ½, ¾, 0.9×) so the "
+                         "sweep/Pareto span your full usable context range")
+    ap.add_argument("--ctx-size", "-c", type=int, default=None,
+                    help="tune at a FIXED context size (like llama.cpp -c): "
+                         "shorthand for --min-context N --max-context N")
     ap.add_argument("--driver", choices=["bench", "server"], default=None,
                     help="benchmark driver (default: from profile). 'server' "
                          "measures real generation incl. MTP and concurrency")
-    ap.add_argument("--parallel", type=int, default=None,
-                    help="concurrent request streams for the server driver "
-                         "(default: from profile)")
+    ap.add_argument("--env", action="append", default=[], metavar="NAME=v1,v2,...",
+                    help="sweep an environment variable as a factor (repeatable), "
+                         "e.g. --env GGML_CUDA_FORCE_MMQ=0,1")
+    ap.add_argument("--factor", action="append", default=[], metavar="NAME=v1,v2,...",
+                    help="override/add a sweepable factor (repeatable), e.g. "
+                         "--factor ngl=56,60,64 --factor nkvo=0,1 --factor poll=0,50")
+    ap.add_argument("--full", action="store_true",
+                    help="thorough: 5 reps per config (steadier numbers, slower)")
+    ap.add_argument("--html", type=Path, default=None,
+                    help="also write a visual HTML report (Pareto + main effects)")
+    ap.add_argument("--iterate", type=int, default=1, metavar="N",
+                    help="run N refinement passes: each settles the low-impact "
+                         "factors at their winner and refines the high-impact ones "
+                         "onto a finer grid (screen -> refine -> ...). default 1")
+    ap.add_argument("--llama-bench", type=Path, default=None,
+                    help="explicit path to the llama-bench binary")
     ap.add_argument("--llama-cpp", type=Path, default=None,
                     help="path to your llama.cpp (its root or build/bin dir). "
                          "Also read from $LLAMA_CPP or $PATH. Required if the "
                          "binaries aren't auto-found.")
     ap.add_argument("--llama-server", type=Path, default=None,
                     help="explicit path to the llama-server binary")
-    ap.add_argument("--min-context", "--ctx-floor", type=int, default=None,
-                    dest="ctx_floor",
-                    help="minimum context you need — BALANCED targets it "
-                         "(default: from profile)")
-    ap.add_argument("--ctx-size", "-c", type=int, default=None,
-                    help="tune at a FIXED context size (like llama.cpp -c): "
-                         "shorthand for --min-context N --max-context N")
-    ap.add_argument("--no-probe", action="store_true",
-                    help="skip the max-context probe (which runs by default after "
-                         "the sweep: binary-searches the physical context ceiling)")
-    ap.add_argument("--probe-ctx", action="store_true",
-                    help=argparse.SUPPRESS)  # deprecated: the probe is now default
-    ap.add_argument("--confirm", action="store_true",
-                    help="after the sweep, run the predicted-optimal config to "
-                         "verify the model's prediction (implied by --full)")
-    ap.add_argument("--selftest", action="store_true",
-                    help="run offline logic checks and exit (no GPU, no model)")
-    ap.add_argument("--reps", type=int, default=None,
-                    help="repetitions per config (default: 3, or --quick=1/--full=5)")
-    ap.add_argument("--n-prompt", type=int, default=None,
-                    help="prompt tokens per measurement (default: from profile)")
-    ap.add_argument("--n-gen", type=int, default=None,
-                    help="generated tokens per measurement (default: from profile)")
     ap.add_argument("--max-context", "--max-depth", type=int, default=None,
                     dest="max_depth",
                     help="cap the context axis and the ceiling probe at this "
                          "many tokens (don't explore above it)")
+    ap.add_argument("--min-context", "--ctx-floor", type=int, default=None,
+                    dest="ctx_floor",
+                    help="minimum context you need — BALANCED targets it, FASTEST "
+                         "only considers configs verified to hold it, and emitted "
+                         "-c is floored at it where the sweep has evidence "
+                         "(default: from profile)")
     ap.add_argument("--min-kv", default="q8_0", metavar="TYPE",
                     help="KV-cache quality floor: never consider a KV type lossier "
                          "than this (default q8_0, near-lossless). 'any' explores "
                          "all; e.g. --min-kv q4_0 to allow aggressive quantization")
+    ap.add_argument("--n-gen", type=int, default=None,
+                    help="generated tokens per measurement (default: from profile)")
+    ap.add_argument("--n-prompt", type=int, default=None,
+                    help="prompt tokens per measurement (default: from profile)")
     ap.add_argument("--no-mtp", action="store_true",
                     help="don't add draft-mtp flags to the emitted server command "
                          "even if the model has an MTP head")
-    ap.add_argument("--spec-draft-n-max", type=int, default=2,
-                    help="--spec-draft-n-max for MTP speculative decoding (default 2)")
-    ap.add_argument("--llama-bench", type=Path, default=None,
-                    help="explicit path to the llama-bench binary")
-    ap.add_argument("--timeout", type=int, default=1200,
-                    help="per-run timeout in seconds")
-    ap.add_argument("--server-start-timeout", type=int, default=180,
-                    help="max seconds to wait for llama-server to load before "
-                         "giving up on a config (default 180)")
-    ap.add_argument("--results-dir", type=Path, default=Path("results"),
-                    help="directory for all output (default: results/)")
+    ap.add_argument("--no-probe", action="store_true",
+                    help="skip the max-context probe (which runs by default after "
+                         "the sweep: binary-searches the physical context ceiling)")
+    ap.add_argument("--no-shuffle", action="store_true",
+                    help="run configs in array order (default: randomized to "
+                         "decorrelate thermal/background drift from factors)")
+    ap.add_argument("--no-thermal-wait", action="store_true",
+                    help="disable the default 'wait and watch' settle that pauses "
+                         "between runs until GPU temp returns near its idle "
+                         "baseline (keeps measurements thermally comparable)")
+    ap.add_argument("--parallel", type=int, default=None,
+                    help="concurrent request streams for the server driver "
+                         "(default: from profile)")
+    ap.add_argument("--probe-ctx", action="store_true",
+                    help=argparse.SUPPRESS)  # deprecated: the probe is now default
+    ap.add_argument("--profile", choices=sorted(PROFILES), default=None,
+                    help="workload profile (request shape + objective): single "
+                         "(interactive), agents (big-context tool use), multi "
+                         "(concurrent serving). Usually set via --use-case; "
+                         "default: single")
+    ap.add_argument("--quick", action="store_true",
+                    help="fast screen: 1 rep per config (noisier, ~1/3 the time)")
+    ap.add_argument("--reps", type=int, default=None,
+                    help="repetitions per config (default: 3, or --quick=1/--full=5)")
     ap.add_argument("--results", type=Path, default=None,
                     help="results CSV name, in --results-dir (default: the model's "
                          "name, e.g. <model>.csv; journal/HTML/pass files land beside)")
+    ap.add_argument("--results-dir", type=Path, default=Path("results"),
+                    help="directory for all output (default: results/)")
     ap.add_argument("--resume", action="store_true",
                     help="skip configs already present in --results (rows are "
                          "saved incrementally, so an interrupted sweep resumes)")
     ap.add_argument("--retry-crashed", action="store_true",
                     help="on resume, also retry configs that were started but never "
                          "finished (suspected machine crash/hang); default skips them")
-    ap.add_argument("--html", type=Path, default=None,
-                    help="also write a visual HTML report (Pareto + main effects)")
-    ap.add_argument("--vram", action="store_true",
-                    help="measure actual peak VRAM used per run (polls "
-                         "rocm-smi/nvidia-smi); records vram_mib and draws the "
-                         "VRAM curve + physical ceiling on the Pareto chart")
-    ap.add_argument("--no-shuffle", action="store_true",
-                    help="run configs in array order (default: randomized to "
-                         "decorrelate thermal/background drift from factors)")
-    ap.add_argument("--seed", type=int, default=None,
-                    help="random seed for execution order (reproducibility)")
-    ap.add_argument("--cooldown", type=float, default=0,
-                    help="seconds to pause between runs so the GPU can cool "
-                         "(reduces thermal-throttling drift; default 0)")
-    ap.add_argument("--iterate", type=int, default=1, metavar="N",
-                    help="run N refinement passes: each settles the low-impact "
-                         "factors at their winner and refines the high-impact ones "
-                         "onto a finer grid (screen -> refine -> ...). default 1")
+    ap.add_argument("--run", action="store_true",
+                    help="actually execute the benchmark sweep (uses the GPU)")
     ap.add_argument("--screen", type=int, nargs="?", const=6, default=None, metavar="R",
                     help="Morris pre-screen with R trajectories (default 6) to rank "
                          "knobs by importance and drop the negligible ones before the "
                          "sweep — cheap (~R*(k+1) runs). Great with many --factor knobs.")
-    ap.add_argument("--ctx-scan", action="store_true",
-                    help="probe the physical context ceiling FIRST, then set the "
-                         "n_depth axis to fractions of it (0, ¼, ½, ¾, 0.9×) so the "
-                         "sweep/Pareto span your full usable context range")
+    ap.add_argument("--seed", type=int, default=None,
+                    help="random seed for execution order (reproducibility)")
+    ap.add_argument("--selftest", action="store_true",
+                    help="run offline logic checks and exit (no GPU, no model)")
+    ap.add_argument("--server-start-timeout", type=int, default=180,
+                    help="max seconds to wait for llama-server to load before "
+                         "giving up on a config (default 180)")
+    ap.add_argument("--spec-draft-n-max", type=int, default=2,
+                    help="--spec-draft-n-max for MTP speculative decoding (default 2)")
+    ap.add_argument("--thermal-baseline", type=float, default=None,
+                    help=argparse.SUPPRESS)  # internal: parent hands the idle
+    #                                          baseline to --iterate child passes
+    ap.add_argument("--thinking", action="store_true",
+                    help="tune for a reasoning/thinking workload — long generations "
+                         "(decode-heavy). Sets n_gen to a reasoning length (~2048); "
+                         "default (no flag) is non-thinking / short answers")
+    ap.add_argument("--timeout", type=int, default=1200,
+                    help="per-run timeout in seconds")
+    ap.add_argument("--use-case", choices=list(USE_CASES), default=None,
+                    metavar="{app,single,agents,multi-user}",
+                    help="high-level runbook that bundles driver+profile+concurrency: "
+                         "app (general/embedded llama.cpp via llama-bench), single "
+                         "(llama-server, one worker/user), agents (several concurrent "
+                         "agents, long tool-use prompts), multi-user (many concurrent "
+                         "chat users). --driver/--profile/--parallel override the "
+                         "runbook.")
+    ap.add_argument("--vram", action="store_true",
+                    help="measure actual peak VRAM used per run (polls "
+                         "rocm-smi/nvidia-smi); records vram_mib and draws the "
+                         "VRAM curve + physical ceiling on the Pareto chart")
     args = ap.parse_args()
 
     if args.selftest:
@@ -2069,6 +2402,14 @@ def main():
             print(f"KV quality floor --min-kv {args.min_kv}: dropping {dropped} "
                   f"(keeping {kept})")
 
+    # Thermal baseline: capture the idle GPU temperature ONCE, before any GPU
+    # work (--ctx-scan/--screen/pass 1 all heat the card), and thread it through
+    # child passes via --thermal-baseline — a child capturing its own "idle" at
+    # the start of pass 2 would bake a hot GPU into the target and neuter the
+    # settle for that whole pass.
+    if args.run and not args.no_thermal_wait and args.thermal_baseline is None:
+        args.thermal_baseline = gpu_temp_c()
+
     # --ctx-scan: probe the physical ceiling first, then make the context axis
     # fractions of it, so the sweep spans the full usable range on THIS hardware.
     if args.ctx_scan and not (os.environ.get("LLAMATUNER_CHILD") or os.environ.get("LLAMATUNE_CHILD")):
@@ -2090,7 +2431,7 @@ def main():
             cap = min(cap, args.max_depth)
         print(f"### Context scan — probing the physical ceiling first "
               f"(ngl={base.get('ngl')} kv={base.get('kv_type')}, cap={cap})...")
-        res = probe_max_context(cfg, base, args.timeout, cap)
+        res = probe_max_context(cfg, base, args.timeout, cap, args.thermal_baseline)
         if not res:
             ap.error("--ctx-scan: base config failed to load even at depth 0")
         ceiling = res[0]
@@ -2156,7 +2497,8 @@ def main():
                  f"{len(cfg.factors)} factors: {e}\n"
                  "  Try --array auto (default) to let it pick a fitting array.")
     print(f"\ngenerated {len(runs)} runs "
-          f"(array={getattr(exp, 'array_type', cfg.array)})")
+          + (f"(array={getattr(exp, 'array_type', cfg.array)})" if exp is not None
+             else "(direct sweep — <=1 varying factor, no array needed)"))
 
     if not args.run:
         print("\n--- PLAN ONLY (no GPU used). Re-run with --run to execute. ---")
@@ -2188,9 +2530,22 @@ def main():
                  "  Is it built for your GPU? Check its ROCm/CUDA/Metal libraries "
                  "are on the loader path (e.g. LD_LIBRARY_PATH), or rebuild llama.cpp.")
 
+    # Idle thermal baseline for the "wait and watch" settle between runs —
+    # captured up front (before ctx-scan/screen) or inherited from the parent.
+    thermal_wait = not args.no_thermal_wait
+    thermal_baseline = args.thermal_baseline if thermal_wait else None
+    if thermal_wait and thermal_baseline is not None:
+        print(f"thermal    : idle baseline {thermal_baseline:.0f}°C — settle to "
+              f"≤{thermal_baseline + THERMAL_BAND_C:.0f}°C between runs "
+              f"(cap {THERMAL_CAP_S:.0f}s; --no-thermal-wait to disable)")
+    elif thermal_wait:
+        print("thermal    : no GPU temp sensor — "
+              + (f"using fixed --cooldown {args.cooldown:.0f}s between runs"
+                 if args.cooldown > 0 else "no settle between runs (see --cooldown)"))
+
     # --- execute sweep ---
     cols = (["run_id"] + list(cfg.factors.keys())
-            + ["pp_tps", "tg_tps", "eff_tps", "status", "secs"]
+            + ["pp_tps", "tg_tps", "eff_tps", "status", "secs", "temp_c"]
             + (["vram_mib"] if cfg.measure_vram else []))
 
     # Resume keys on run_id (unique per array row), not config values, because
@@ -2224,8 +2579,10 @@ def main():
     if args.resume and not args.retry_crashed:
         tried_load, ok_load, tried_run = read_journal(journal_path)
         crashed_loads = set(tried_load) - ok_load
+        # screen runs journal into the same file but are not sweep rows — a
+        # completed screen must not resurface as phantom CRASH rows on resume
         crashed = {str(rid): fac for rid, fac in tried_run.items()
-                   if str(rid) not in done}
+                   if str(rid) not in done and not str(rid).startswith("screen-")}
         for run in runs:                       # runs whose server load crashed
             rid = str(run.get("run_id"))
             if rid not in done and load_key_str(cfg, run["factors"]) in crashed_loads:
@@ -2311,6 +2668,8 @@ def main():
                               f"{f['kv_type']} KV cache, {f['n_depth']}-token context, "
                               f"ubatch {f['ubatch']}")
                     journal_write(journal, "TRY", "run", rid, json.dumps(f))  # durable
+                    temp0 = gpu_temp_c()   # start temp: thermal comparability is
+                    #                        checkable in the CSV, not assumed
                     if cfg.driver == "server":
                         res = with_ticker(
                             prefix, args.timeout,
@@ -2320,7 +2679,8 @@ def main():
                         res = run_with_progress(cfg, f, args.timeout, prefix)
                     res["eff_tps"] = effective_tps(cfg.n_prompt, cfg.n_gen,
                                                    res["pp_tps"], res["tg_tps"])
-                    row = {"run_id": rid, **f, **res}
+                    row = {"run_id": rid, **f, **res,
+                           "temp_c": f"{temp0:.0f}" if temp0 is not None else ""}
                     rows.append(row)
                     writer.writerow(row)   # incremental save: survive a crash/kill
                     fh.flush()
@@ -2331,8 +2691,11 @@ def main():
                           f"pp={res['pp_tps']:.1f}) ({res['secs']:.0f}s)  "
                           f"[{i}/{len(runs)} done, elapsed {fmt_dur(elapsed)}, "
                           f"ETA ~{fmt_dur(eta)}]", flush=True)
-                    if args.cooldown > 0:
-                        time.sleep(args.cooldown)  # let the GPU settle (thermal)
+                    if i < len(runs):                  # settle before the next run
+                        if thermal_wait and thermal_baseline is not None:
+                            wait_until_cool(thermal_baseline)
+                        elif args.cooldown > 0:
+                            time.sleep(args.cooldown)  # fixed fallback, no sensor
             finally:
                 if session:
                     session.close()
@@ -2353,6 +2716,9 @@ def main():
         f = {k: cfg.factors[k][0] for k in cfg.factors}
         f.update({k: str(v) for k, v in opt.items() if k in cfg.factors})
         print("\n### Confirmation run (predicted-optimal config)")
+        # the prediction came from settled runs — measure the check settled too,
+        # or a hot GPU masquerades as "interactions"
+        wait_until_cool(thermal_baseline)
         prefix = "confirm: " + " ".join(f"{k}={f[k]}" for k in cfg.factors)
         res = with_ticker(prefix, args.timeout,
                           lambda: drive_one(cfg, f, args.timeout))
@@ -2381,7 +2747,7 @@ def main():
             print(f"\n### Max-context probe  (config: ngl={base_row.get('ngl')} "
                   f"kv={base_row.get('kv_type')} ub={base_row.get('ubatch')}, "
                   f"cap={cap})")
-            res = probe_max_context(cfg, base, args.timeout, cap)
+            res = probe_max_context(cfg, base, args.timeout, cap, thermal_baseline)
             if res:
                 depth, tps = res
                 print(f"  largest context that loads: ~{depth} tokens"
