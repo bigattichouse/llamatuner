@@ -94,10 +94,12 @@ runs on them. This is what makes it practical to throw a dozen `--factor`s at th
 tool. Runs the `robust` **morris** binary.
 
 **2. Taguchi orthogonal array — "what's the optimum among the survivors?"** A Taguchi
-**L25** array estimates every surviving factor's main effect in **25 runs** instead
-of 3125 — a >99% reduction — keeping the levels balanced so each effect reads
-independently. `--iterate` then refines: it settles the low-impact factors at their
-winner and re-runs the high-impact ones on a finer grid, converging on the optimum.
+array (**L25** for up to 6 varying factors, **L125** beyond — auto-sized) estimates
+every surviving factor's main effect in 25–125 runs instead of thousands, keeping
+the levels balanced so each effect reads independently. `--iterate` then refines: it
+settles the low-impact factors at their winner and re-runs the high-impact ones on a
+finer grid, converging on the optimum — and the final pass folds **every** earlier
+pass's measurements back into its report, so refinement can only add information.
 `--confirm` measures the predicted-optimal config directly to check the additive
 model held. Runs the `robust`/`taguchi` library via its Python binding.
 
@@ -115,15 +117,29 @@ already flags interactions cheaply.)
 
 ## What it tunes
 
-Five factors by default (auto-scaled to your hardware and model):
+Swept by default (auto-scaled to your hardware and model):
 
-| Factor        | llama-bench flag | Levels (example, Qwen3.6-27B on MI50) | Notes |
+| Factor        | Flag             | Levels (example, Qwen3.6-27B on MI50) | Notes |
 |---------------|------------------|----------------------------------------|-------|
 | GPU layers    | `-ngl`           | `0, 16, 32, 48, 64`                    | biggest lever; top = model's real layer count |
 | Context depth | `-d` (n-depth)   | 5 levels `0..min(native ctx, 65536)`   | KV pre-fill; the speed-vs-context axis, adaptive to the model's native context |
 | CPU threads   | `-t`             | `4, 6, 8, 12, 16`                      | auto-derived around the physical-core count |
 | KV cache type | `-ctk`/`-ctv`    | `f16, q8_0` (default)                  | KV precision; **floored to near-lossless** by `--min-kv q8_0` |
 | Micro-batch   | `-ub`            | `128, 256, 512, 1024, 2048`            | prefill/decode balance |
+| KV offload    | `-nkvo`          | `0, 1`                                 | KV cache in VRAM vs system RAM — the VRAM-vs-PCIe lever |
+| CPU polling   | `--poll`         | `0, 50, 100`                           | busy-wait level for CPU-side work |
+| Logical batch | `-b`             | `2048, 4096, 8192`                     | prompt chunking (levels start at max `-ub` so the `b≥ub` clamp never aliases) |
+| Tensor placement | `-ot`         | `none, ffn_up_cpu, ffn_cpu`            | **dense models**: FFN tensors on CPU at full `-ngl` often beats dropping whole layers |
+| MoE expert offload | `-ncmoe`   | `0 .. n_layers` (5 levels)             | **MoE models** (replaces `-ot`): how many layers keep experts on CPU |
+| NUMA policy   | `--numa`         | `distribute, isolate`                  | **multi-NUMA-node boxes only** (inert on one node) |
+| Prefill threads | `-tb`          | same levels as `-t`                    | **server driver**: decode vs prefill thread split |
+| MTP on/off    | `--spec-type draft-mtp` | `1, 0`                          | **MTP models, server driver**: measures what speculative decoding actually buys |
+| MTP draft len | `--spec-draft-n-max` / `-min` | `1..6` / `1, 2`           | **MTP models, server driver**: speculative draft lengths |
+| MTP acceptance | `--spec-draft-p-min` / `-p-split` | `0.0..0.9` / `0.1..0.5` | **MTP models, server driver**: draft acceptance thresholds |
+
+A model that ships an MTP/NextN head (e.g. Unsloth Dynamic quants) **auto-switches to
+the server driver** so the whole MTP surface is measured, not just emitted —
+llama-bench can't do speculative decoding (`--driver bench` or `--no-mtp` overrides).
 
 The KV factor is quality-gated: `--min-kv` (default `q8_0`, near-lossless) drops the
 lossier levels so the tool never recommends a KV type that degrades output over long
@@ -131,12 +147,18 @@ context. Pass `--min-kv any` to explore the full `f16, q8_0, q5_1, q4_1, q4_0` l
 (quantizing the KV cache buys context at some quality cost).
 
 **Fixed** (not swept): flash-attention on (`-fa 1` — a near-certain win on gfx906 and
-a *precondition* for quantized KV cache), mmap on (bench `-mmp 1`; the server default),
-batch `-b 2048` (fixed to avoid invalid `batch < ubatch` combinations). Any of these
-can still be swept explicitly with `--factor` (e.g. `--factor fa=0,1`).
+a *precondition* for quantized KV cache, so sweeping it would structurally fail every
+`fa=0` × KV-quant row) and mmap on (bench `-mmp 1`; the server default). Sweep fa
+explicitly with `--factor fa=0,1 --min-kv f16`. Also not swept by default: CPU
+affinity masks (`cpu_mask`/`cpu_range` — no universal levels), RoPE/YaRN scaling
+(extends context by *changing model behavior*, a quality tradeoff, not a perf knob),
+and `parallel` (a property of your workload — set it via `--use-case`/`--parallel`).
 
-With 5 factors an L25 array has one spare column left as an error/variance estimate
-that flags when the additive main-effects model is breaking down.
+Up to 6 varying factors fit an **L25** array (25 runs); the default set above
+overflows that, so a bare `--run` now draws an **L125** (125 runs, a few hours).
+Use `--screen` to Morris-prune the factors that don't matter first (usually
+funneling the sweep back down to an L25), `--quick` for 1 rep/config, or pin
+factors (`--factor threads=8`) to shrink the design.
 
 ---
 
@@ -180,10 +202,13 @@ The **profile** sets the representative request shape the sweep optimizes for:
 | **agents** | 8192 + 256 | 32768 | bench | big-context tool use / RAG |
 | **multi** | 1024 + 256 | 8192 | server | concurrent serving (`--parallel N`) |
 
-The objective is **effective throughput** for that request —
-`(P + G) / (P/pp_tps + G/tg_tps)` — which weighs prefill and decode the way the
-workload actually experiences them, instead of optimizing raw decode alone. (A
-nice side effect: it no longer degenerates to "zero context is fastest".)
+The objective the stats optimize is **generation throughput** (`tg` t/s) by
+default: prompt-processing speed is measured and reported, but doesn't move the
+fits or the picks — blending it in lets a config with slow decode but a huge
+prefill number outrank one that generates far faster. If your workload really is
+prefill-bound, `--score eff` switches the objective to **effective throughput**
+for that request — `(P + G) / (P/pp_tps + G/tg_tps)` — which weighs prefill and
+decode the way the workload experiences them.
 Override the shape with `--n-prompt/--n-gen/--ctx-floor`, the engine with
 `--driver bench|server`, and concurrency with `--parallel N`.
 
@@ -194,7 +219,7 @@ For each config, `llama-bench` reports two throughput numbers, both captured:
 - **`tg_tps`** — token-generation t/s (decode speed; what you feel interactively).
   This is what the optimizer maximizes.
 - **`pp_tps`** — prompt-processing t/s (prefill speed; matters for long-context/RAG).
-  Reported alongside.
+  Reported alongside; `--score eff` folds it into the objective.
 
 Runs that **OOM, crash, or time out** are recorded as data (`tg=0`, with a status of
 `OOM`/`ERROR`/`TIMEOUT`) rather than aborting the sweep. High context depth at low
@@ -223,7 +248,7 @@ The tool inspects the box and the model so you don't hand-tune the factor levels
 
 ```
 ### FASTEST (max speed, usable context)
-  eff=… t/s  (tg=…  pp=…)  depth=…  ngl=…  t=…  kv=…  ub=…
+  tg=… t/s  (pp=…)  depth=…  ngl=…  t=…  kv=…  ub=…
   suggested llama-server command:
     ./llama-server -m model.gguf -ngl … -t … -c … -ctk … -ctv … -ub … -b 2048 -fa 1
 
@@ -233,19 +258,20 @@ The tool inspects the box and the model so you don't hand-tune the factor levels
 ### MAX CONTEXT
   …
 
-### Pareto frontier (context vs effective t/s)
-  depth=  4096  eff=…  (tg=…)  ngl=…  kv=…  ub=…
-  depth= 12288  eff=…  …
+### Pareto frontier (context vs generation t/s)
+  depth=  4096  tg=…  ngl=…  kv=…  ub=…
+  depth= 12288  tg=…  …
 
-### Taguchi main effects (effective t/s, higher = better)
+### Taguchi main effects (generation t/s, higher = better)
   <per-factor level means, ranked by impact>
   Predicted-optimal levels: {…}
 
 ### Confirmation run (predicted-optimal config)     # with --confirm/--full
-  predicted eff: … t/s   measured eff: … t/s   prediction error: …%
+  predicted tg: … t/s   measured tg: … t/s   prediction error: …%
 ```
 
-The objective is **effective throughput** for the profile's request shape,
+The objective is **generation t/s** by default; with `--score eff` the reports
+switch to blended effective throughput for the profile's request shape,
 `(P+G)/(P/pp+G/tg)`. Full per-run data is written to `results.csv` (incrementally,
 so it survives a crash — see below).
 
@@ -305,6 +331,13 @@ grid** around their best value, converging on the optimum (stops early if factor
 converge). Each pass writes `results.passN.csv`; the final pass gets `--confirm`/
 `--html` if requested. This *is* the loop below, automated.
 
+Every pass after the first also **merges all earlier passes' rows into its
+report, picks, and Pareto** (`--merge-results`, added automatically), so the
+final answer is drawn from *everything* measured — a refinement pass that
+wanders into a worse region (noise, drift) can no longer make the final report
+worse than pass 1. Refinement *decisions* and the main-effects table still use
+only the current pass's balanced design.
+
 **Manual** (if you want to steer each pass yourself) — the same idea, by hand:
 
 1. **Screen** — a quick coarse sweep to rank the knobs:
@@ -346,7 +379,7 @@ order (default) plus `--full` reps already averages out most drift.
 python3 llama-optimize.py MODEL.gguf [options]
 
   --array A          orthogonal array (default: auto-picks the smallest that
-                     fits your factors; advanced: force L9/L18/L25/L27/L125/...)
+                     fits your factors; advanced: force L9/L25/L27/L125/...)
   --confirm          run the predicted-optimal config to verify the additive
                      model (predicted vs actual; implied by --full)
   --cooldown SECS    fixed pause between runs so the GPU can cool — the fallback
@@ -354,18 +387,23 @@ python3 llama-optimize.py MODEL.gguf [options]
   --ctx-scan         probe the ceiling FIRST, then set the n_depth axis to fractions
                      of it (0, ¼, ½, ¾, 0.9×) so the Pareto spans your full range
   --ctx-size N, -c N tune at a FIXED context (like llama.cpp -c) = min==max==N
-  --driver bench|server  benchmark driver (default: from profile). 'server'
-                     measures real generation incl. MTP + concurrency
+  --driver bench|server  benchmark driver (default: from profile; MTP-capable
+                     models auto-switch to server). 'server' measures real
+                     generation incl. MTP + concurrency
   --env NAME=v1,v2,...      sweep an environment variable as a factor (repeatable)
   --factor NAME=v1,v2,...   sweep/override a knob (repeatable; see Knob reference)
   --full             thorough: 5 reps/config (steadier, slower)
   --html PATH        also write a visual HTML report (Pareto + main effects)
   --iterate N        run N auto-refining passes (screen -> refine -> ...): settle
-                     low-impact factors, refine high-impact ones on a finer grid
+                     low-impact factors, refine high-impact ones on a finer grid;
+                     the final report/picks merge ALL passes' results
   --llama-bench PATH path to the llama-bench binary
   --llama-cpp PATH   path to llama.cpp (root or build/bin); also $LLAMA_CPP/$PATH
   --llama-server PATH  path to the llama-server binary
   --max-context N    cap the context axis and the ceiling probe (alias: --max-depth)
+  --merge-results CSV  fold rows from an earlier results CSV into this run's
+                     report/picks/Pareto without re-running them (repeatable;
+                     --iterate adds these automatically for earlier passes)
   --min-context N    minimum context you need: BALANCED targets it, FASTEST only
                      considers configs verified to hold it, and emitted -c is
                      floored at it where the sweep has evidence (alias: --ctx-floor)
@@ -391,6 +429,9 @@ python3 llama-optimize.py MODEL.gguf [options]
   --retry-crashed    on resume, also retry configs that were started but never
                      finished (suspected crash/hang); default skips them
   --run              actually execute the sweep (default: plan/dry-run, no GPU)
+  --score tg|eff     objective for stats/fits/picks: 'tg' (default) ranks by
+                     generation speed alone (pp measured + reported, not scored);
+                     'eff' ranks by blended effective t/s for the request shape
   --screen [R]       Morris pre-screen (R trajectories, default 6): rank knobs by
                      importance, drop the negligible ones, then sweep the rest
   --seed N           seed the randomized order (reproducibility)
@@ -448,26 +489,31 @@ registry in `llama-optimize.py`.
 | `threads` | `-t` | both | num | swept | CPU threads for decode |
 | `kv_type` | `-ctk -ctv` | both | cat | swept | KV cache precision (buys context) |
 | `ubatch` | `-ub` | both | num | swept | physical micro-batch |
-| `ncmoe` | `-ncmoe` | both | num | opt-in¹ | MoE expert layers kept on CPU |
-| `batch` | `-b` | both | num | opt-in | logical batch |
-| `nkvo` | `-nkvo` | both | bool | opt-in | keep KV in RAM vs VRAM |
-| `poll` | `--poll` | both | num | opt-in | CPU polling level |
-| `numa` | `--numa` | both | cat | opt-in | NUMA optimization mode |
+| `ncmoe` | `-ncmoe` | both | num | swept¹ | MoE expert layers kept on CPU |
+| `batch` | `-b` | both | num | swept | logical batch (levels ≥ max ubatch) |
+| `nkvo` | `-nkvo` | both | bool | swept | keep KV in RAM vs VRAM |
+| `poll` | `--poll` | both | num | swept | CPU polling level |
+| `numa` | `--numa` | both | cat | swept⁴ | NUMA optimization mode |
 | `cpu_mask` | `-C` | both | cat | opt-in | CPU affinity mask (hex, e.g. `0xFF`) |
 | `cpu_strict` | `--cpu-strict` | both | cat | opt-in | strict CPU placement (0/1) |
 | `cpu_range` | `-Cr` | server | cat | opt-in | CPU affinity range (`lo-hi`) |
 | `fa` | `-fa` | both | cat | opt-in² | flash attention on/off |
-| `ot` | `-ot` | both | cat | opt-in | per-tensor placement — the VRAM-fit lever (named patterns below) |
-| `threads_batch` | `-tb` | server | num | opt-in | CPU threads for prompt processing |
+| `ot` | `-ot` | both | cat | swept¹ | per-tensor placement — the VRAM-fit lever (named patterns below) |
+| `threads_batch` | `-tb` | server | num | swept | CPU threads for prompt processing |
 | `parallel` | `--parallel` | server | num | opt-in | concurrent request streams (multi) |
-| `spec_n_max` | `--spec-draft-n-max` | server | num | opt-in | MTP draft tokens (max) |
-| `spec_n_min` | `--spec-draft-n-min` | server | num | opt-in | MTP draft tokens (min) |
-| `spec_p_min` | `--spec-draft-p-min` | server | float | opt-in | MTP acceptance-probability threshold |
-| `spec_p_split` | `--spec-draft-p-split` | server | float | opt-in | MTP split probability |
+| `mtp` | `--spec-type draft-mtp` | server | cat | swept³ | speculative decoding via the model's MTP head, on/off |
+| `spec_n_max` | `--spec-draft-n-max` | server | num | swept³ | MTP draft tokens (max) |
+| `spec_n_min` | `--spec-draft-n-min` | server | num | swept³ | MTP draft tokens (min) |
+| `spec_p_min` | `--spec-draft-p-min` | server | float | swept³ | MTP acceptance-probability threshold |
+| `spec_p_split` | `--spec-draft-p-split` | server | float | swept³ | MTP split probability |
 | `rope_scaling` | `--rope-scaling` | server | cat | opt-in | RoPE scaling: none/linear/yarn |
 | `yarn_factor` | `--yarn-ext-factor` | server | float | opt-in | YaRN extrapolation (context **beyond** native) |
 
-¹ auto-added when the model is MoE.  ² fixed on unless swept (precondition for KV-quant).
+¹ `ncmoe` swept for MoE models, `ot` for dense ones (the same placement lever, per
+architecture).  ² fixed on unless swept (precondition for KV-quant; pair with
+`--min-kv f16`).  ³ swept when the model ships an MTP/NextN head — such models also
+auto-switch to the server driver so the effect is measured (`--no-mtp` disables).
+⁴ swept only on machines with multiple NUMA nodes (inert on one node).
 
 **`-ot` named patterns** (translate to real tensor regexes): `none`, `ffn_cpu`,
 `ffn_up_cpu`, `exps_cpu`, `attn_cpu`.
@@ -528,8 +574,9 @@ python3 llama-optimize.py model-UD.gguf --run --driver server \
   **measures MTP** and **multi-user concurrency**), with server reuse across runs.
 - **Use-case runbooks** (`--use-case app|single|agents|multi-user`) that bundle
   driver + profile + concurrency, over **workload profiles** (`--profile
-  single|agents|multi`) and an **effective-throughput** objective that weighs
-  prefill vs decode as the workload experiences them.
+  single|agents|multi`) and a selectable objective (`--score`: generation t/s by
+  default, or blended effective throughput that weighs prefill vs decode as the
+  workload experiences them).
 - **The funnel** — `--screen` (Morris: rank knobs by μ\*, flag interactions by σ,
   drop the negligible) → `--iterate N` (auto-refine the survivors) → `--confirm`
   (verify the prediction) → `--html` report.

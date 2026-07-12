@@ -182,6 +182,14 @@ def detect_physical_cores() -> int:
     return max(1, detect_logical_cores() // 2)
 
 
+def detect_numa_nodes() -> int:
+    """Number of NUMA nodes (1 when undetectable / not Linux)."""
+    try:
+        return max(1, len(list(Path("/sys/devices/system/node").glob("node[0-9]*"))))
+    except OSError:
+        return 1
+
+
 def detect_vram_mib() -> int | None:
     """Best-effort total VRAM in MiB. Tries AMD (rocm-smi) then NVIDIA
     (nvidia-smi); None if neither is available."""
@@ -538,6 +546,7 @@ class Config:
     parallel: int = 1             # concurrent request streams (server driver)
     server_start_timeout: int = 180  # max seconds to wait for llama-server to load
     measure_vram: bool = False       # sample peak VRAM used during each run
+    score: str = "tg"             # objective: "tg" (decode only) or "eff" (blend pp+tg)
     factors: dict = field(default_factory=dict)
     hw: dict = field(default_factory=dict)
     env_factor_names: set = field(default_factory=set)  # factors that set env vars
@@ -551,6 +560,16 @@ def effective_tps(n_prompt: int, n_gen: int, pp: float, tg: float) -> float:
     return (n_prompt + n_gen) / (n_prompt / pp + n_gen / tg)
 
 
+def objective_tps(cfg: Config, pp: float, tg: float) -> float:
+    """The score a run contributes to fits/stats/picks (stored as eff_tps).
+    Default (--score tg): pure generation speed — pp is still measured and
+    reported, but a huge prefill number can't make a slow generator outrank a
+    fast one. --score eff blends both into effective request throughput."""
+    if cfg.score == "eff":
+        return effective_tps(cfg.n_prompt, cfg.n_gen, pp, tg)
+    return tg if tg > 0 else 0.0
+
+
 def build_factors(cfg: Config):
     phys = cfg.hw["phys"]
     logical = cfg.hw["logical"]
@@ -562,12 +581,46 @@ def build_factors(cfg: Config):
         "threads": [str(x) for x in thread_levels(phys, logical)],
         "kv_type": list(DEFAULT_KV_LEVELS),
         "ubatch": [str(x) for x in DEFAULT_UBATCH_LEVELS],
+        # KV offload (-nkvo) is the VRAM-vs-bandwidth lever: keeping the KV
+        # cache in system RAM frees VRAM for layers at a PCIe cost that only a
+        # measurement can price on a given box. (fa stays fixed: flash-attn is
+        # a precondition for quantized KV, so sweeping it would just fail every
+        # fa=0 × KV-quant row — sweep it via --factor fa=0,1 --min-kv f16.)
+        "nkvo": ["0", "1"],
+        # An L125 fits 31 factors at the same 125 runs, so the remaining clean
+        # knobs ride along free. batch levels start at the largest ubatch level
+        # so the -b >= -ub clamp never fires (clamping would alias low batch
+        # levels with high ubatch ones and muddy both estimates).
+        "poll": ["0", "50", "100"],
+        "batch": ["2048", "4096", "8192"],
     }
+    if cfg.driver == "server":
+        # decode threads (-t) and prefill threads (-tb) can want different
+        # counts; only llama-server exposes the split
+        factors["threads_batch"] = [str(x) for x in thread_levels(phys, logical)]
+    # only sweep NUMA policy on a machine that actually has multiple nodes
+    # (on a single node it's an inert column)
+    if cfg.hw.get("numa_nodes", 1) > 1:
+        factors["numa"] = ["distribute", "isolate"]
     # For MoE models, expert CPU-offload (-ncmoe) is the biggest RAM/VRAM lever,
-    # so promote it to a swept factor (uses L25's 6th column). For dense models
-    # it would be inert, so we leave that column spare for error estimation.
+    # so promote it to a swept factor. For dense models the equivalent lever is
+    # tensor placement (-ot): keeping FFN tensors on CPU at full -ngl often
+    # beats dropping whole layers (attn_cpu is left out — attention on CPU
+    # kills decode; exps_cpu is inert without experts).
     if cfg.hw.get("n_experts", 0) > 0:
         factors["ncmoe"] = [str(x) for x in ncmoe_levels(n_layers)]
+    else:
+        factors["ot"] = ["none", "ffn_up_cpu", "ffn_cpu"]
+    # A model with an MTP/NextN head on the server driver: sweep the whole
+    # speculative-decoding surface — on/off, draft lengths, and acceptance
+    # thresholds — so the report MEASURES what MTP buys instead of assuming it.
+    # Bench can't speculate (server-only knobs), and --no-mtp opts out.
+    if cfg.driver == "server" and cfg.emit_mtp and cfg.hw.get("n_nextn", 0) > 0:
+        factors["mtp"] = ["1", "0"]
+        factors["spec_n_max"] = ["1", "2", "3", "4", "6"]
+        factors["spec_n_min"] = ["1", "2"]
+        factors["spec_p_min"] = ["0.0", "0.25", "0.5", "0.75", "0.9"]
+        factors["spec_p_split"] = ["0.1", "0.3", "0.5"]
     return factors
 
 
@@ -593,10 +646,10 @@ def choose_array(factors: dict) -> str | None:
     counts = [len(v) for v in factors.values() if len(v) > 1]
     if len(counts) <= 1:
         return None
-    nf, mx, n2 = len(counts), max(counts), sum(1 for c in counts if c == 2)
-    # one 2-level factor mixed with 3-level factors is the classic L18 case
-    if mx == 3 and n2 >= 1 and nf <= 8:
-        return "L18"
+    nf, mx = len(counts), max(counts)
+    # Mixed level counts ride on the array of the largest base (a 2-level factor
+    # maps onto a 5-level column with a modulo imbalance the level means absorb).
+    # The binding only ships pure 2/3/5-level arrays — no mixed L18/L36/L50.
     base = 2 if mx <= 2 else 3 if mx == 3 else 5 if mx <= 5 else None
     if base is None:
         return None
@@ -694,6 +747,8 @@ FACTORS = {
     # --- context (request-time) ---
     "n_depth":      {"bench": ("-d",), "server": None, "kind": "num", "request": True},
     # --- speculative decoding / MTP (server only) ---
+    "mtp":          {"bench": None, "server": ("--spec-type",), "kind": "cat", "server_only": True,
+                     "translate": {"1": "draft-mtp", "0": ""}},   # on/off: "" omits the flag
     "spec_n_max":   {"bench": None, "server": ("--spec-draft-n-max",), "kind": "num", "server_only": True},
     "spec_n_min":   {"bench": None, "server": ("--spec-draft-n-min",), "kind": "num", "server_only": True},
     "spec_p_min":   {"bench": None, "server": ("--spec-draft-p-min",), "kind": "float", "server_only": True},
@@ -791,7 +846,8 @@ def server_command(cfg: Config, f: dict, ctx: int) -> str:
     # server driver this speedup IS measured; with llama-bench it is NOT (bench
     # can't do speculative decoding) and stacks on top of the reported t/s.
     if cfg.emit_mtp and cfg.hw.get("n_nextn", 0) > 0:
-        parts.append("--spec-type draft-mtp")
+        if "mtp" not in f:                    # MTP fixed on unless swept
+            parts.append("--spec-type draft-mtp")
         if "spec_n_max" not in f:
             parts.append(f"--spec-draft-n-max {cfg.spec_draft_n_max}")
     cmd = " \\\n    ".join(["./llama-server"] + parts)
@@ -919,7 +975,8 @@ def build_server_args(cfg: Config, f: dict, port: int, n_ctx: int) -> list[str]:
     if "parallel" not in f and cfg.parallel > 1:   # concurrency (fixed) if not swept
         args += ["--parallel", str(cfg.parallel)]
     if cfg.emit_mtp and cfg.hw.get("n_nextn", 0) > 0:
-        args += ["--spec-type", "draft-mtp"]
+        if "mtp" not in f:                         # MTP fixed on unless swept
+            args += ["--spec-type", "draft-mtp"]
         if "spec_n_max" not in f:                  # default n_max if not swept
             args += ["--spec-draft-n-max", str(cfg.spec_draft_n_max)]
     return args
@@ -1281,8 +1338,12 @@ def report(cfg: Config, rows: list[dict]):
                   "boost (bench can't do spec decoding). Use --driver server to "
                   "measure it.")
 
-    print(f"objective  : effective t/s for a {cfg.profile} request "
-          f"({cfg.n_prompt} prompt + {cfg.n_gen} gen tokens)")
+    if cfg.score == "eff":
+        print(f"objective  : effective t/s for a {cfg.profile} request "
+              f"({cfg.n_prompt} prompt + {cfg.n_gen} gen tokens)")
+    else:
+        print("objective  : generation t/s (decode only; pp reported but not "
+              "scored — --score eff to blend prefill in)")
 
     fastest, balanced, longest = pick_recommendations(cfg, rows)
 
@@ -1291,8 +1352,10 @@ def report(cfg: Config, rows: list[dict]):
             print(f"\n### {title}: none met the constraint")
             return
         print(f"\n### {title}")
-        print(f"  eff={score_of(r):.1f} t/s  (tg={r['tg_tps']:.1f}  "
-              f"pp={r['pp_tps']:.1f})  depth={r['n_depth']}  ngl={r['ngl']}  "
+        raw = ((f"tg={r['tg_tps']:.1f}  " if cfg.score == "eff" else "")
+               + f"pp={r['pp_tps']:.1f}")
+        print(f"  {cfg.score}={score_of(r):.1f} t/s  ({raw})  "
+              f"depth={r['n_depth']}  ngl={r['ngl']}  "
               f"t={r['threads']}  kv={r['kv_type']}  ub={r['ubatch']}")
         # size context to what the sweep verified for this config, floored at
         # the usable floor where evidence allows (see recommended_ctx); a
@@ -1308,10 +1371,12 @@ def report(cfg: Config, rows: list[dict]):
     show(f"BALANCED (best with context >= {cfg.ctx_floor})", balanced)
     show("MAX CONTEXT", longest)
 
-    print("\n### Pareto frontier (context vs effective t/s)")
+    kind = "effective" if cfg.score == "eff" else "generation"
+    print(f"\n### Pareto frontier (context vs {kind} t/s)")
     for r in pareto_frontier(rows):
-        print(f"  depth={int(r['n_depth']):>6}  eff={score_of(r):6.1f} t/s  "
-              f"(tg={r['tg_tps']:5.1f})  ngl={r['ngl']:>3}  "
+        raw = f"(tg={r['tg_tps']:5.1f})  " if cfg.score == "eff" else ""
+        print(f"  depth={int(r['n_depth']):>6}  {cfg.score}={score_of(r):6.1f} t/s  "
+              f"{raw}ngl={r['ngl']:>3}  "
               f"kv={r['kv_type']:>4}  ub={r['ubatch']:>4}")
 
 
@@ -1383,7 +1448,8 @@ def refine_factors(cfg: Config, rows: list[dict]) -> dict:
     return new
 
 
-def _svg_pareto(rows: list[dict], vram_total: float = 0) -> str:
+def _svg_pareto(rows: list[dict], vram_total: float = 0,
+                ylabel: str = "effective t/s") -> str:
     """Inline SVG: effective t/s (left y) vs context (x), all OK runs as faint dots,
     the Pareto frontier as a highlighted line. If runs carry measured VRAM, overlay
     the VRAM curve on a right-hand axis plus the physical-ceiling line. Theme-neutral."""
@@ -1476,7 +1542,7 @@ def _svg_pareto(rows: list[dict], vram_total: float = 0) -> str:
         f"{''.join(g)}<polyline points='{poly}' class='fline'/>{dots}{fdots}{vram_svg}"
         f"<text x='{(ml + W - mr) / 2:.0f}' y='{H - 6}' class='albl'>context (tokens)</text>"
         f"<text x='16' y='{cy:.0f}' class='albl' transform='rotate(-90 16 {cy:.0f})'>"
-        f"effective t/s</text>{vaxis}</svg>")
+        f"{ylabel}</text>{vaxis}</svg>")
 
 
 def write_html_report(cfg: Config, rows: list[dict], path: Path):
@@ -1496,9 +1562,11 @@ def write_html_report(cfg: Config, rows: list[dict], path: Path):
         cmd = esc(server_command(cfg, r, ctx))
         tip = "".join(f"<div class=muted>{esc(x)}</div>"
                       for x in (kv_downgrade_hint(r), ctx_floor_note(cfg, r, ctx)) if x)
+        raw = ((f"tg {r['tg_tps']:.1f} · " if cfg.score == "eff" else "")
+               + f"pp {r['pp_tps']:.1f}")
         return (f"<div class=card><h3>{esc(title)}</h3>"
-                f"<div class=big>{score_of(r):.1f} <span class=unit>eff t/s</span></div>"
-                f"<div class=muted>tg {r['tg_tps']:.1f} · pp {r['pp_tps']:.1f} · "
+                f"<div class=big>{score_of(r):.1f} <span class=unit>{cfg.score} t/s</span></div>"
+                f"<div class=muted>{raw} · "
                 f"depth {esc(r['n_depth'])} · ngl {esc(r['ngl'])} · kv {esc(r['kv_type'])} · "
                 f"ub {esc(r['ubatch'])} · t {esc(r['threads'])}</div>"
                 f"<pre>{cmd}</pre>{tip}</div>")
@@ -1524,22 +1592,28 @@ def write_html_report(cfg: Config, rows: list[dict], path: Path):
             f"<div class=fx><div class=fxh><b>{esc(name)}</b>"
             f"<span class=muted>impact {rng:.1f} ({impact:.0f}%)</span></div>{bars}</div>")
 
-    # pareto table
+    # pareto table (the score IS tg under --score tg: no separate tg column)
+    blend = cfg.score == "eff"
     par_rows = "".join(
         f"<tr><td>{int(r['n_depth'])}</td><td>{score_of(r):.1f}</td>"
-        f"<td>{r['tg_tps']:.1f}</td><td>{esc(r['ngl'])}</td><td>{esc(r['kv_type'])}</td>"
+        + (f"<td>{r['tg_tps']:.1f}</td>" if blend else "")
+        + f"<td>{esc(r['ngl'])}</td><td>{esc(r['kv_type'])}</td>"
         f"<td>{esc(r['ubatch'])}</td></tr>" for r in pareto)
+    par_head = (f"<th>context</th><th>{cfg.score} t/s</th>"
+                + ("<th>tg</th>" if blend else "")
+                + "<th>ngl</th><th>kv</th><th>ubatch</th>")
 
     # all-runs table
     fcols = list(cfg.factors.keys())
     head = "".join(f"<th>{esc(c)}</th>" for c in
-                   ["run", *fcols, "eff", "tg", "pp", "status"])
+                   ["run", *fcols, *(["eff"] if blend else []), "tg", "pp", "status"])
     body = ""
     for r in sorted(rows, key=lambda r: score_of(r), reverse=True):
         cells = "".join(f"<td>{esc(r.get(c, ''))}</td>" for c in fcols)
         cls = "" if r["status"] == "OK" else " class=bad"
         body += (f"<tr{cls}><td>{esc(r.get('run_id',''))}</td>{cells}"
-                 f"<td>{score_of(r):.1f}</td><td>{float(r['tg_tps']):.1f}</td>"
+                 + (f"<td>{score_of(r):.1f}</td>" if blend else "")
+                 + f"<td>{float(r['tg_tps']):.1f}</td>"
                  f"<td>{float(r['pp_tps']):.1f}</td><td>{esc(r['status'])}</td></tr>")
 
     meta = (f"{esc(cfg.model.name)} · {cfg.hw.get('n_layers','?')} layers · "
@@ -1571,20 +1645,22 @@ th{{color:#888;font-weight:600}} tr.bad{{opacity:.5}}
 .chart{{max-width:100%;height:auto;display:block;margin:6px 0 18px}}
 </style>
 <h1>llama-optimize report</h1>
-<div class=meta>{meta}<br>objective: effective t/s for a {esc(cfg.profile)} request
+<div class=meta>{meta}<br>objective: {"effective t/s" if blend else
+ "generation t/s (pp reported, not scored)"} for a {esc(cfg.profile)} request
  ({cfg.n_prompt} prompt + {cfg.n_gen} gen tokens) — {len(ok)}/{len(rows)} configs OK</div>
 <div class=cards>{card('Fastest (usable)', best)}{card(f'Balanced (≥{cfg.ctx_floor})', balanced)}{card('Max context', longest)}</div>
 <h2>What matters (main effects, by impact)</h2>{''.join(fx_html)}
-<h2>Pareto frontier (context vs effective t/s)</h2>
-{_svg_pareto(rows, cfg.hw.get("vram", 0) if cfg.measure_vram else 0)}
-<table><tr><th>context</th><th>eff t/s</th><th>tg</th><th>ngl</th><th>kv</th><th>ubatch</th></tr>{par_rows}</table>
+<h2>Pareto frontier (context vs {"effective" if blend else "generation"} t/s)</h2>
+{_svg_pareto(rows, cfg.hw.get("vram", 0) if cfg.measure_vram else 0,
+             ylabel=("effective t/s" if blend else "generation t/s"))}
+<table><tr>{par_head}</tr>{par_rows}</table>
 <h2>All runs</h2><table><tr>{head}</tr>{body}</table>
 """
     path.write_text(doc)
     print(f"\nwrote HTML report: {path}")
 
 
-def taguchi_effects(exp, rows: list[dict]):
+def taguchi_effects(cfg: Config, exp, rows: list[dict]):
     """Main-effects on the objective. Returns (optimal_levels, predicted_score)
     or (None, None)."""
     if exp is None:
@@ -1610,7 +1686,8 @@ def taguchi_effects(exp, rows: list[dict]):
     try:
         with Analyzer(exp, metric_name="eff_tps") as an:
             an.add_results_from_dict(results)
-            print("\n### Taguchi main effects (effective t/s, higher = better)")
+            kind = "effective" if cfg.score == "eff" else "generation"
+            print(f"\n### Taguchi main effects ({kind} t/s, higher = better)")
             if n_failed:
                 print(f"(note: {n_failed} failed run(s) scored as 0 t/s)")
             print(an.summary())
@@ -1739,6 +1816,19 @@ def selftest() -> bool:
                    - 768 / (512 / 1000 + 256 / 100)) < 1e-6
         assert set(PROFILES) == {"single", "agents", "multi"}
 
+        # scoring: tg-only by default — a huge pp can't mask slow decode;
+        # --score eff restores the blended request throughput
+        cfg_o = Config(model=Path("m"), llama_bench=Path("b"), array="auto",
+                       ctx_floor=8192, n_prompt=512, n_gen=256)
+        assert cfg_o.score == "tg"
+        assert objective_tps(cfg_o, 5000.0, 8.4) == 8.4
+        assert objective_tps(cfg_o, 0.0, 100.0) == 100.0  # pp glitch ≠ failed run
+        assert objective_tps(cfg_o, 100.0, 0.0) == 0.0
+        cfg_o.score = "eff"
+        assert abs(objective_tps(cfg_o, 1000.0, 100.0)
+                   - effective_tps(512, 256, 1000.0, 100.0)) < 1e-9
+        assert objective_tps(cfg_o, 0.0, 100.0) == 0.0    # blend needs both
+
         # recommended -c never exceeds the verified footprint (regression:
         # a row measured at depth 49152 must NOT be emitted as -c 65536).
         cfgc = Config(model=Path("m.gguf"), llama_bench=Path("lb"), array="L25",
@@ -1824,8 +1914,13 @@ def selftest() -> bool:
         assert choose_array({f"f{i}": ["a", "b", "c", "d", "e"] for i in range(5)}) == "L25"
         assert choose_array({f"f{i}": ["a", "b", "c"] for i in range(6)}) == "L27"
         assert choose_array({f"f{i}": ["0", "1"] for i in range(7)}) == "L8"
+        # mixed levels ride the largest base's array (the binding has no L18):
+        # a 2-level factor among 3-level ones maps onto a 3-level column
         assert choose_array({"a": ["0", "1"], "b": ["x", "y", "z"],
-                             "c": ["p", "q", "r"]}) == "L18"
+                             "c": ["p", "q", "r"]}) == "L9"
+        # 7 varying factors overflow L25's 6 columns -> the 125-run array
+        assert choose_array({f"f{i}": ["a", "b", "c", "d", "e"]
+                             for i in range(7)}) == "L125"
         # a fixed (1-level) factor among 3-level ones still picks a 3-level array
         assert choose_array({"t": ["8"], "a": ["1", "2", "3"],
                              "b": ["1", "2", "3"]}) == "L9"
@@ -1879,6 +1974,41 @@ def selftest() -> bool:
         assert factor_flags(cfg_s, {"nkvo": "1"}, "server", 512) == [["-nkvo"]]  # bare
         assert factor_flags(cfg_s, {"nkvo": "1"}, "bench", 512) == [["-nkvo", "1"]]
 
+        # MTP as a swept factor: on/off via translate ("" omits), server-only
+        assert factor_flags(cfg_s, {"mtp": "1"}, "server", 512) == \
+            [["--spec-type", "draft-mtp"]]
+        assert factor_flags(cfg_s, {"mtp": "0"}, "server", 512) == []
+        assert factor_flags(cfg_s, {"mtp": "1"}, "bench", 512) == []
+        cfg_m = Config(model=Path("m"), llama_bench=Path("b"), array="auto",
+                       ctx_floor=8192, driver="server",
+                       hw={"phys": 8, "logical": 16, "n_layers": 32,
+                           "n_ctx_train": 32768, "n_experts": 0, "n_nextn": 1})
+        sa = build_server_args(cfg_m, {"mtp": "0", "ubatch": "512"}, 8080, 4096)
+        assert "--spec-type" not in sa      # swept off: automatic flag yields
+        sa = build_server_args(cfg_m, {"ubatch": "512"}, 8080, 4096)
+        assert "--spec-type" in sa and "draft-mtp" in sa  # fixed on if not swept
+        # default factor set: nkvo/poll/batch always; ot for dense / ncmoe for
+        # MoE; threads_batch + the MTP surface only on the server driver;
+        # numa only on a multi-node box
+        fs = build_factors(cfg_m)
+        assert all(k in fs for k in ("nkvo", "poll", "batch", "threads_batch",
+                                     "mtp", "spec_n_max", "spec_n_min",
+                                     "spec_p_min", "spec_p_split"))
+        assert "ot" in fs and "ncmoe" not in fs            # dense
+        assert "numa" not in fs                            # single NUMA node
+        cfg_m.hw["numa_nodes"] = 2
+        assert "numa" in build_factors(cfg_m)
+        cfg_m.hw["numa_nodes"] = 1
+        cfg_m.driver = "bench"
+        fs = build_factors(cfg_m)
+        assert "nkvo" in fs and "poll" in fs and "batch" in fs
+        assert all(k not in fs for k in ("mtp", "spec_n_max", "spec_n_min",
+                                         "spec_p_min", "spec_p_split",
+                                         "threads_batch"))  # server-only
+        cfg_m.hw["n_experts"] = 64
+        fs = build_factors(cfg_m)
+        assert "ncmoe" in fs and "ot" not in fs            # MoE
+
         # KV quality floor
         assert kv_at_or_above(["f16", "q8_0", "q5_1", "q4_0"], "q8_0") == ["f16", "q8_0"]
         assert kv_at_or_above(["f16", "q8_0", "q4_0"], "any") == ["f16", "q8_0", "q4_0"]
@@ -1915,14 +2045,15 @@ def load_results_csv(path: Path, factors: dict) -> list[dict]:
 
 
 def build_child_argv(args, cfg: Config, factors: dict, results_path: Path,
-                     final: bool) -> list[str]:
+                     final: bool, prev_results: list[Path]) -> list[str]:
     """One pass's command line for the single-pass tool (explicit everything so
     the child reproduces the resolved config)."""
     argv = [str(args.model), "--run",
             "--driver", cfg.driver, "--profile", cfg.profile, "--array", "auto",
             "--reps", str(cfg.reps), "--n-prompt", str(cfg.n_prompt),
             "--n-gen", str(cfg.n_gen), "--ctx-floor", str(cfg.ctx_floor),
-            "--parallel", str(cfg.parallel), "--timeout", str(args.timeout),
+            "--parallel", str(cfg.parallel), "--score", cfg.score,
+            "--timeout", str(args.timeout),
             "--cooldown", str(args.cooldown),
             "--spec-draft-n-max", str(cfg.spec_draft_n_max),
             "--llama-bench", str(cfg.llama_bench),
@@ -1944,6 +2075,11 @@ def build_child_argv(args, cfg: Config, factors: dict, results_path: Path,
     if args.max_depth is not None:
         argv += ["--max-depth", str(args.max_depth)]
     argv += ["--min-kv", "any"]   # parent already applied the floor; don't re-filter
+    # Carry every earlier pass's measurements into this pass's report/picks: a
+    # refinement pass can chase a noise-led region, and without the merge the
+    # final answer would FORGET a better config pass 1 already measured.
+    for rp in prev_results:
+        argv += ["--merge-results", str(rp)]
     for name, levels in factors.items():
         flag = "--env" if name in cfg.env_factor_names else "--factor"
         argv += [flag, f"{name}={','.join(str(x) for x in levels)}"]
@@ -1963,6 +2099,7 @@ def run_iterations(args, cfg: Config):
     base = args.results
     suffix = base.suffix or ".csv"
     factors = dict(cfg.factors)
+    prev: list[Path] = []
     for p in range(1, args.iterate + 1):
         final = p == args.iterate
         rp = base.with_name(f"{base.stem}.pass{p}{suffix}")
@@ -1971,7 +2108,7 @@ def run_iterations(args, cfg: Config):
               + ", ".join(f"{k}={'/'.join(str(x) for x in v)}"
                           for k, v in factors.items()))
         print("#" * 70, flush=True)
-        argv = build_child_argv(args, cfg, factors, rp, final)
+        argv = build_child_argv(args, cfg, factors, rp, final, prev)
         env = {**os.environ, "LLAMA_OPTIMIZE_CHILD": "1"}
         rc = subprocess.call([sys.executable, os.path.abspath(__file__), *argv], env=env)
         if rc != 0:
@@ -1983,13 +2120,14 @@ def run_iterations(args, cfg: Config):
         if not rows:
             print("no results to refine from; stopping.")
             return
+        prev.append(rp)
         cfg.factors = factors
         refined = refine_factors(cfg, rows)
         if refined == factors or all(len(v) == 1 for v in refined.values()):
             print("\nfactors converged — stopping refinement early.")
             return
         factors = refined
-    print(f"\nAll passes complete. Final report + results: "
+    print(f"\nAll passes complete. Final report + results (all passes merged): "
           f"{base.with_name(f'{base.stem}.pass{args.iterate}{suffix}')}")
 
 
@@ -2094,10 +2232,10 @@ def morris_screen(cfg: Config, args, ap, trajectories: int):
                 journal_write(journal, "TRY", "run", f"screen-{rid}", json.dumps(f))
                 res = with_ticker(prefix, args.timeout,
                                   lambda ff=f: drive_one(cfg, ff, args.timeout))
-                eff = effective_tps(cfg.n_prompt, cfg.n_gen, res["pp_tps"], res["tg_tps"])
+                eff = objective_tps(cfg, res["pp_tps"], res["tg_tps"])
                 status = res["status"]
                 cache[ckey] = eff
-                print(f"{prefix} -> {status} eff={eff:.1f} t/s", flush=True)
+                print(f"{prefix} -> {status} {cfg.score}={eff:.1f} t/s", flush=True)
                 # the screen decides which knobs get DROPPED — settle it like
                 # the sweep so drift doesn't rank the factors
                 if args.thermal_baseline is not None:
@@ -2123,6 +2261,11 @@ def morris_screen(cfg: Config, args, ap, trajectories: int):
     keep = [n for n, mu, _ in rankings if mu >= 0.1 * max_mu]
     if not keep:                       # never drop everything
         keep = [rankings[0][0]]
+    # n_depth is the report's tradeoff axis (speed vs context), not a knob to
+    # settle — dropping it here would collapse the Pareto/picks to one depth
+    # (same guard as refine_factors).
+    if "n_depth" in cfg.factors and "n_depth" not in keep:
+        keep.append("n_depth")
     dropped = [n for n, _, _ in rankings if n not in keep]
     interacting = [n for n, mu, s in rankings if mu > 0 and s >= mu / 2]
 
@@ -2182,7 +2325,10 @@ def main():
     ap.add_argument("--iterate", type=int, default=1, metavar="N",
                     help="run N refinement passes: each settles the low-impact "
                          "factors at their winner and refines the high-impact ones "
-                         "onto a finer grid (screen -> refine -> ...). default 1")
+                         "onto a finer grid (screen -> refine -> ...). The final "
+                         "report/picks merge ALL passes' results, so extra passes "
+                         "can only add information, never lose pass 1's best. "
+                         "default 1")
     ap.add_argument("--llama-bench", type=Path, default=None,
                     help="explicit path to the llama-bench binary")
     ap.add_argument("--llama-cpp", type=Path, default=None,
@@ -2195,6 +2341,13 @@ def main():
                     dest="max_depth",
                     help="cap the context axis and the ceiling probe at this "
                          "many tokens (don't explore above it)")
+    ap.add_argument("--merge-results", action="append", type=Path, default=[],
+                    metavar="CSV",
+                    help="fold rows from an earlier results CSV into this run's "
+                         "report/picks/Pareto without re-running them (repeatable; "
+                         "--iterate uses this to carry every pass into the final "
+                         "report). Main-effects stay on this run's own balanced "
+                         "design.")
     ap.add_argument("--min-context", "--ctx-floor", type=int, default=None,
                     dest="ctx_floor",
                     help="minimum context you need — BALANCED targets it, FASTEST "
@@ -2249,6 +2402,11 @@ def main():
                          "finished (suspected machine crash/hang); default skips them")
     ap.add_argument("--run", action="store_true",
                     help="actually execute the benchmark sweep (uses the GPU)")
+    ap.add_argument("--score", choices=["tg", "eff"], default="tg",
+                    help="objective for stats/fits/picks: 'tg' (default) ranks by "
+                         "generation speed alone (pp is measured and reported but "
+                         "can't sway the pick); 'eff' ranks by blended effective "
+                         "t/s for the profile's request (prefill + decode)")
     ap.add_argument("--screen", type=int, nargs="?", const=6, default=None, metavar="R",
                     help="Morris pre-screen with R trajectories (default 6) to rank "
                          "knobs by importance and drop the negligible ones before the "
@@ -2340,6 +2498,16 @@ def main():
     llama_bench = resolve_binary("llama-bench", args.llama_bench, args.llama_cpp)
     llama_server = resolve_binary("llama-server", args.llama_server, args.llama_cpp)
 
+    # A model with an MTP/NextN head defaults to the server driver: llama-bench
+    # cannot do speculative decoding, so on bench the MTP speedup is neither
+    # measured nor tunable (its knobs are server-only). An explicit --driver or
+    # --use-case still wins, as does --no-mtp; needs llama-server built.
+    if (driver == "bench" and args.driver is None and uc.get("driver") is None
+            and (n_nextn or 0) > 0 and not args.no_mtp and llama_server.exists()):
+        driver = "server"
+        print("note: model has an MTP head — driver auto-switched to server so "
+              "the sweep measures and tunes MTP (--driver bench to override)")
+
     cfg = Config(
         model=args.model.resolve(),
         llama_bench=llama_bench,
@@ -2355,10 +2523,12 @@ def main():
         profile=profile,
         driver=driver,
         parallel=parallel,
+        score=args.score,
         measure_vram=args.vram,
         server_start_timeout=args.server_start_timeout,
         hw={"phys": phys, "logical": logical, "n_layers": n_layers, "vram": vram,
-            "n_experts": n_experts, "n_ctx_train": n_ctx_train, "n_nextn": n_nextn},
+            "n_experts": n_experts, "n_ctx_train": n_ctx_train, "n_nextn": n_nextn,
+            "numa_nodes": detect_numa_nodes()},
     )
     cfg.factors = build_factors(cfg)
     if args.ctx_size is not None:            # fixed context: don't sweep n_depth
@@ -2472,22 +2642,30 @@ def main():
     if n_ctx_train:
         print(f"native ctx : {n_ctx_train}")
     if n_nextn:
-        emit = "will add --spec-type draft-mtp to server cmd" if cfg.emit_mtp \
-               else "disabled (--no-mtp)"
+        emit = ("swept as factors (mtp on/off, spec_n_max)" if "mtp" in cfg.factors
+                else "will add --spec-type draft-mtp to server cmd" if cfg.emit_mtp
+                else "disabled (--no-mtp)")
         print(f"MTP        : yes ({n_nextn} NextN layer(s)) — {emit}")
         if cfg.driver == "bench":
             print("             hint: add --driver server to MEASURE the MTP "
                   "speedup (bench can't); otherwise it's only emitted")
     print(f"profile    : {cfg.profile}  (request {cfg.n_prompt} prompt + "
           f"{cfg.n_gen} gen tokens; driver={cfg.driver})")
+    print("objective  : " + ("eff (effective t/s: blends pp + tg)"
+                             if cfg.score == "eff" else
+                             "tg (generation t/s; pp reported, not scored)"))
     mode = "quick" if args.quick else "full" if args.full else "standard"
     print(f"mode       : {mode}  ({cfg.reps} rep{'s' if cfg.reps != 1 else ''}/config)")
     print(f"array      : {cfg.array}   ctx floor: {cfg.ctx_floor}")
     print("\nfactors:")
     for name, levels in cfg.factors.items():
         print(f"  {name:10s}: {', '.join(levels)}")
-    print(f"fixed      : flash-attn {'on' if FIXED_FA else 'off'}, "
-          f"mmap {'on' if FIXED_MMAP else 'off'}, batch {FIXED_BATCH}  "
+    fixed_bits = [f"mmap {'on' if FIXED_MMAP else 'off'}"]
+    if "fa" not in cfg.factors:
+        fixed_bits.insert(0, f"flash-attn {'on' if FIXED_FA else 'off'}")
+    if "batch" not in cfg.factors:
+        fixed_bits.append(f"batch {FIXED_BATCH}")
+    print(f"fixed      : {', '.join(fixed_bits)}  "
           f"(p={cfg.n_prompt} n={cfg.n_gen} reps={cfg.reps})")
 
     try:
@@ -2560,6 +2738,9 @@ def main():
                         r[c] = float(r[c])
                     except (KeyError, ValueError, TypeError):
                         r[c] = 0.0
+                # re-score under the CURRENT --score mode, not whatever mode
+                # wrote the CSV — a resumed sweep must fit one objective
+                r["eff_tps"] = objective_tps(cfg, r["pp_tps"], r["tg_tps"])
                 if r.get("run_id"):
                     rows.append(r)
                     done.add(str(r["run_id"]))
@@ -2677,8 +2858,7 @@ def main():
                                 cfg, ff, ss, args.timeout))
                     else:
                         res = run_with_progress(cfg, f, args.timeout, prefix)
-                    res["eff_tps"] = effective_tps(cfg.n_prompt, cfg.n_gen,
-                                                   res["pp_tps"], res["tg_tps"])
+                    res["eff_tps"] = objective_tps(cfg, res["pp_tps"], res["tg_tps"])
                     row = {"run_id": rid, **f, **res,
                            "temp_c": f"{temp0:.0f}" if temp0 is not None else ""}
                     rows.append(row)
@@ -2686,9 +2866,10 @@ def main():
                     fh.flush()
                     elapsed = time.time() - sweep_start
                     eta = (elapsed / i) * (len(runs) - i)
+                    raw = (f"tg={res['tg_tps']:.1f} pp={res['pp_tps']:.1f}"
+                           if cfg.score == "eff" else f"pp={res['pp_tps']:.1f}")
                     print(f"{prefix} -> {res['status']} "
-                          f"eff={res['eff_tps']:.1f} t/s (tg={res['tg_tps']:.1f} "
-                          f"pp={res['pp_tps']:.1f}) ({res['secs']:.0f}s)  "
+                          f"{cfg.score}={res['eff_tps']:.1f} t/s ({raw}) ({res['secs']:.0f}s)  "
                           f"[{i}/{len(runs)} done, elapsed {fmt_dur(elapsed)}, "
                           f"ETA ~{fmt_dur(eta)}]", flush=True)
                     if i < len(runs):                  # settle before the next run
@@ -2704,11 +2885,33 @@ def main():
         journal.close()
     print(f"\nwrote {args.results}")
 
-    report(cfg, rows)
-    opt, predicted = taguchi_effects(exp, rows)
+    # Fold in rows from earlier results files (--merge-results, e.g. previous
+    # --iterate passes) so the report/picks/Pareto/probe consider every config
+    # ever measured — the final answer can then never be worse than an earlier
+    # pass's best. Main-effects/confirm stay on THIS run's balanced design
+    # (the analyzer needs the array structure, and merged rows would skew it).
+    all_rows = list(rows)
+    for mi, mpath in enumerate(args.merge_results, 1):
+        prev = load_results_csv(mpath, cfg.factors)
+        m = re.search(r"\.(pass\d+)$", mpath.stem)
+        tag = m.group(1) if m else f"merge{mi}"
+        added = 0
+        for r in prev:
+            if not all(str(r.get(k, "")) != "" for k in cfg.factors):
+                continue               # foreign CSV missing a factor column
+            # re-score under the CURRENT --score mode (same rule as --resume)
+            r["eff_tps"] = objective_tps(cfg, r["pp_tps"], r["tg_tps"])
+            r["run_id"] = f"{tag}:{r.get('run_id', '')}"
+            all_rows.append(r)
+            added += 1
+        print(f"merged {added} row(s) from {mpath.name} into the report"
+              if added else f"merge: no usable rows in {mpath}")
+
+    report(cfg, all_rows)
+    opt, predicted = taguchi_effects(cfg, exp, rows)
 
     if args.html:
-        write_html_report(cfg, rows, args.html)
+        write_html_report(cfg, all_rows, args.html)
 
     if (args.confirm or args.full) and opt:
         # Run the predicted-optimal config directly to check the additive model
@@ -2722,11 +2925,13 @@ def main():
         prefix = "confirm: " + " ".join(f"{k}={f[k]}" for k in cfg.factors)
         res = with_ticker(prefix, args.timeout,
                           lambda: drive_one(cfg, f, args.timeout))
-        actual = effective_tps(cfg.n_prompt, cfg.n_gen, res["pp_tps"], res["tg_tps"])
-        print(f"  predicted eff: "
+        actual = objective_tps(cfg, res["pp_tps"], res["tg_tps"])
+        raw = (f"tg={res['tg_tps']:.1f} pp={res['pp_tps']:.1f}"
+               if cfg.score == "eff" else f"pp={res['pp_tps']:.1f}")
+        print(f"  predicted {cfg.score}: "
               + (f"{predicted:.1f} t/s" if predicted else "(n/a)"))
-        print(f"  measured  eff: {actual:.1f} t/s  (tg={res['tg_tps']:.1f} "
-              f"pp={res['pp_tps']:.1f}, status={res['status']})")
+        print(f"  measured  {cfg.score}: {actual:.1f} t/s  "
+              f"({raw}, status={res['status']})")
         if predicted and actual > 0:
             err = abs(actual - predicted) / predicted * 100
             verdict = ("additive model holds — trust the prediction" if err <= 15
@@ -2734,7 +2939,7 @@ def main():
             print(f"  prediction error: {err:.0f}%  → {verdict}")
 
     if not args.no_probe and args.ctx_size is None:   # fixed context: no ceiling search
-        ok = [r for r in rows if r["status"] == "OK"]
+        ok = [r for r in all_rows if r["status"] == "OK"]
         if ok:
             # Probe the config that reaches FURTHEST (max measured depth, then
             # fastest) — the memory-lightest good config — so this is the true
