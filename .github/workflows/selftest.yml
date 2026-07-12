@@ -1,0 +1,25 @@
+name: selftest
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  selftest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Selftest (stdlib only, no submodule build needed)
+        run: python3 llama-optimize.py --selftest
+
+      - name: Build robust/taguchi submodule
+        run: make -C taguchi
+
+      # The selftest deliberately avoids the array binding; exercise the paths
+      # that need it: array generation (incl. L125, mixed levels riding 5-level
+      # columns) and the main-effects analyzer.
+      - name: Binding smoke test (L25/L125 generation + analyzer)
+        run: python3 .github/workflows/binding_smoke.py

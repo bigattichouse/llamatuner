@@ -335,8 +335,10 @@ Every pass after the first also **merges all earlier passes' rows into its
 report, picks, and Pareto** (`--merge-results`, added automatically), so the
 final answer is drawn from *everything* measured — a refinement pass that
 wanders into a worse region (noise, drift) can no longer make the final report
-worse than pass 1. Refinement *decisions* and the main-effects table still use
-only the current pass's balanced design.
+worse than pass 1. Re-measured configs are deduplicated (a merged row is kept
+only if it beats every known measurement of that exact config), so the tables
+don't repeat rows across passes. Refinement *decisions* and the main-effects
+table still use only the current pass's balanced design.
 
 **Manual** (if you want to steer each pass yourself) — the same idea, by hand:
 
@@ -387,6 +389,10 @@ python3 llama-optimize.py MODEL.gguf [options]
   --ctx-scan         probe the ceiling FIRST, then set the n_depth axis to fractions
                      of it (0, ¼, ½, ¾, 0.9×) so the Pareto spans your full range
   --ctx-size N, -c N tune at a FIXED context (like llama.cpp -c) = min==max==N
+  --diff OLD.csv NEW.csv  compare two sweeps of the same factor space (llama.cpp
+                     upgrade, driver update, quant swap): per-config tg deltas,
+                     status changes (OOM -> OK, ...), and whether the old winner
+                     still wins. No model or GPU needed; exits after the report
   --driver bench|server  benchmark driver (default: from profile; MTP-capable
                      models auto-switch to server). 'server' measures real
                      generation incl. MTP + concurrency

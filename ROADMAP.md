@@ -41,13 +41,12 @@ FACTORS registry — the biggest untuned lever on 2+-card boxes.
 - Sensible default levels: `sm=layer,row`; `ts` around the VRAM ratio.
 - Needs multi-GPU hardware to validate.
 
-## 4. Results-diff mode
+## 4. ~~Results-diff mode~~ — done
 
 `--diff old.csv new.csv` compares two sweeps of the same factor space
-(llama.cpp upgrade, driver update, quant swap): per-config deltas on matched
-factor rows and whether the old winner still wins. All the loading/scoring
-machinery already exists (`load_results_csv`, the `--merge-results` path);
-mostly a report function.
+(llama.cpp upgrade, driver update, quant swap): per-config tg deltas on the
+factor columns both files share, status changes, and whether the old winner
+still wins.
 
 ## 5. Time-to-first-token metric
 
@@ -57,12 +56,15 @@ interactive use where great `tg` with slow prefill still *feels* worse.
 - Report alongside `pp`/`tg` (timestamp of first streamed token).
 - Not a new objective initially; could later back a `--score ttft`.
 
-## 6. CI for the selftest
+## 6. ~~CI for the selftest~~ — done
 
-GitHub Action running `python3 llama-optimize.py --selftest` on push/PR.
+GitHub Action running the selftest on push/PR, plus a binding smoke test
+(builds the submodule, exercises L25/L125 generation and the analyzer — the
+paths the selftest deliberately skips).
 
 ## Small cleanups
 
-- `--merge-results` rows aren't deduplicated against the current pass, so a
-  config measured in two passes shows up twice in the Pareto table. Dedupe by
-  factor values, freshest measurement winning.
+- ~~`--merge-results` rows aren't deduplicated against the current pass~~ —
+  done: a merged row is kept only if it beats every known measurement of that
+  exact config, so the Pareto/all-runs tables don't repeat rows across passes
+  (and the never-lose-an-earlier-best guarantee is preserved).

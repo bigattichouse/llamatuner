@@ -17,7 +17,9 @@ Nothing touches the GPU unless --run is given.
 """
 
 import argparse
+import contextlib
 import csv
+import io
 import json
 import os
 import random
@@ -28,6 +30,7 @@ import struct
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -1829,6 +1832,58 @@ def selftest() -> bool:
                    - effective_tps(512, 256, 1000.0, 100.0)) < 1e-9
         assert objective_tps(cfg_o, 0.0, 100.0) == 0.0    # blend needs both
 
+        # --diff and --merge-results dedup (temp CSVs; offline, no binding)
+        with tempfile.TemporaryDirectory() as td:
+            cols = ["run_id", "ngl", "n_depth", "pp_tps", "tg_tps", "eff_tps",
+                    "status", "secs", "temp_c"]
+
+            def wcsv(name, rws):
+                p = Path(td) / name
+                with open(p, "w", newline="") as fh:
+                    w = csv.DictWriter(fh, fieldnames=cols)
+                    w.writeheader()
+                    w.writerows(rws)
+                return p
+
+            def rrow(i, ngl, tg, status="OK"):
+                return {"run_id": i, "ngl": ngl, "n_depth": "0", "pp_tps": 500.0,
+                        "tg_tps": tg, "eff_tps": tg, "status": status,
+                        "secs": 5, "temp_c": ""}
+
+            old = wcsv("run.pass1.csv", [rrow(1, "32", 40.0), rrow(2, "16", 30.0),
+                                         rrow(3, "48", 0.0, "OOM")])
+            new = wcsv("new.csv", [rrow(1, "32", 44.0), rrow(2, "16", 29.0),
+                                   rrow(3, "48", 50.0)])
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                s = diff_results(old, new)
+                assert s["matched"] == 3 and s["compared"] == 2
+                assert s["status_changes"] == 1             # ngl=48: OOM -> OK
+                assert s["old_winner_still_wins"] is False  # 48 took the lead
+                assert abs(s["new_best_tg"] - 50.0) < 1e-9
+                assert diff_results(old, Path(td) / "missing.csv") is None
+
+                # merge dedup: a merged row is kept only if it beats every
+                # known measurement of that exact config
+                cfg_r = Config(model=Path("m"), llama_bench=Path("b"),
+                               array="auto", ctx_floor=8192)
+                cfg_r.factors = {"ngl": ["16", "32", "48"], "n_depth": ["0"]}
+                out = merge_result_rows(cfg_r, [rrow(9, "32", 42.0)], [old])
+                assert len(out) == 3                    # 32 deduped; 16+48 added
+                got = {r["ngl"]: r for r in out}
+                assert got["32"]["tg_tps"] == 42.0      # current row won the dup
+                assert got["16"]["run_id"] == "pass1:2"  # tagged with its pass
+                assert got["48"]["status"] == "OOM"     # failures still carried
+                # a FASTER earlier measurement does get in (never lose a best)
+                out = merge_result_rows(cfg_r, [rrow(9, "32", 39.0)], [old])
+                assert {r["tg_tps"] for r in out
+                        if r["ngl"] == "32"} == {39.0, 40.0}
+                # no merge files: rows pass through untouched (no dedup of the
+                # array's own intentional replicates)
+                reps = [rrow(1, "32", 40.0), rrow(2, "32", 41.0)]
+                assert merge_result_rows(cfg_r, reps, []) is reps
+            assert "NEW winner: ngl=48" in buf.getvalue()
+
         # recommended -c never exceeds the verified footprint (regression:
         # a row measured at depth 49152 must NOT be emitted as -c 65536).
         cfgc = Config(model=Path("m.gguf"), llama_bench=Path("lb"), array="L25",
@@ -1881,8 +1936,6 @@ def selftest() -> bool:
         # a RISING temperature (post-run heat soak) is not a plateau (regression:
         # `prev - t < 0.5` was true for negatives, exiting at the hottest moment);
         # a genuine stall (cooling < 0.5°C/poll) or reaching baseline+band settles.
-        import contextlib
-        import io
         real_temp, calls = gpu_temp_c, []
 
         def fake_temp(seq):
@@ -2042,6 +2095,167 @@ def load_results_csv(path: Path, factors: dict) -> list[dict]:
                     r[c] = 0.0
             rows.append(r)
     return rows
+
+
+# results-CSV columns that are measurements/bookkeeping; everything else in a
+# header is a factor column (must match the writer's `cols` in main)
+RESULT_COLS = {"run_id", "pp_tps", "tg_tps", "eff_tps", "status", "secs",
+               "temp_c", "vram_mib"}
+
+
+def merge_result_rows(cfg: Config, rows: list[dict],
+                      merge_paths: list[Path]) -> list[dict]:
+    """Fold rows from earlier results CSVs (--merge-results, e.g. previous
+    --iterate passes) into the row set the report/picks/Pareto/probe see, so
+    every config ever measured is considered — the final answer can then never
+    be worse than an earlier pass's best. A merged row is kept only if it beats
+    every already-known measurement of that exact config (same value for every
+    factor), so re-measured configs don't pad the Pareto/all-runs tables with
+    duplicates. Main-effects/confirm stay on this run's own rows (the analyzer
+    needs the balanced array structure; merged rows would skew it)."""
+    if not merge_paths:
+        return rows
+
+    def key(r):
+        return tuple(str(r.get(k, "")) for k in cfg.factors)
+
+    known: dict[tuple, float] = {}
+    for r in rows:
+        k = key(r)
+        known[k] = max(known.get(k, 0.0), score_of(r))
+    merged: dict[tuple, dict] = {}
+    for mi, mpath in enumerate(merge_paths, 1):
+        m = re.search(r"\.(pass\d+)$", mpath.stem)
+        tag = m.group(1) if m else f"merge{mi}"
+        folded = 0
+        for r in load_results_csv(mpath, cfg.factors):
+            if not all(str(r.get(k, "")) != "" for k in cfg.factors):
+                continue               # foreign CSV missing a factor column
+            # re-score under the CURRENT --score mode (same rule as --resume)
+            r["eff_tps"] = objective_tps(cfg, r["pp_tps"], r["tg_tps"])
+            r["run_id"] = f"{tag}:{r.get('run_id', '')}"
+            k = key(r)
+            if k in known and known[k] >= score_of(r):
+                continue               # this config already measured >= as fast
+            if k in merged and score_of(merged[k]) >= score_of(r):
+                continue
+            merged[k] = r
+            folded += 1
+        print(f"merged {folded} row(s) from {mpath.name} into the report"
+              if folded else
+              f"merge: no new rows from {mpath.name} (duplicates or unusable)")
+    return rows + list(merged.values())
+
+
+def diff_results(old_path: Path, new_path: Path) -> dict | None:
+    """Compare two results CSVs of the same factor space (llama.cpp upgrade,
+    driver update, quant swap): match configs on the factor columns both files
+    share, then report per-config deltas, status changes, and whether the old
+    winner still wins. Compares raw tg_tps (pp alongside) — eff_tps depends on
+    the --score mode and request shape a sweep ran with, so it isn't comparable
+    across files. Returns a summary dict (for the selftest), None if the files
+    can't be compared. Needs no model, GPU, or submodule."""
+    def load(path):
+        rows = load_results_csv(path, {})
+        cols = [c for c in (rows[0].keys() if rows else []) if c not in RESULT_COLS]
+        return rows, cols
+
+    old_rows, old_cols = load(old_path)
+    new_rows, new_cols = load(new_path)
+    for path, rows in ((old_path, old_rows), (new_path, new_rows)):
+        if not rows:
+            print(f"diff: no rows in {path}")
+            return None
+    common = [c for c in old_cols if c in new_cols]
+    if not common:
+        print(f"diff: {old_path.name} and {new_path.name} share no factor columns")
+        return None
+    ignored = sorted(set(old_cols).symmetric_difference(new_cols))
+
+    def okrow(r):
+        return r.get("status") == "OK" and r["tg_tps"] > 0
+
+    def index(rows):
+        # several rows can share a key (replicates; or a factor column only the
+        # other file has) — keep each config's best measurement
+        d: dict[tuple, dict] = {}
+        for r in rows:
+            k = tuple(str(r.get(c, "")) for c in common)
+            if k not in d or r["tg_tps"] > d[k]["tg_tps"]:
+                d[k] = r
+        return d
+
+    def cfgstr(k):
+        return " ".join(f"{c}={v}" for c, v in zip(common, k))
+
+    old_i, new_i = index(old_rows), index(new_rows)
+    both = [k for k in old_i if k in new_i]
+
+    print(f"diff: {old_path.name} (old) -> {new_path.name} (new)")
+    if ignored:
+        print(f"  ignoring factor column(s) not in both files: {', '.join(ignored)}")
+    print(f"  configs: {len(old_i)} old, {len(new_i)} new, {len(both)} matched "
+          f"({len(old_i) - len(both)} only-old, {len(new_i) - len(both)} only-new)")
+
+    deltas, status_changes = [], []
+    for k in both:
+        o, n = old_i[k], new_i[k]
+        if okrow(o) and okrow(n):
+            deltas.append((n["tg_tps"] / o["tg_tps"] - 1.0, k, o, n))
+        elif o.get("status") != n.get("status"):
+            status_changes.append((k, o.get("status"), n.get("status")))
+
+    if status_changes:
+        print(f"\n  status changes ({len(status_changes)}):")
+        for k, so, sn in status_changes[:10]:
+            print(f"    {so:>7} -> {sn:<7}  {cfgstr(k)}")
+        if len(status_changes) > 10:
+            print(f"    ... and {len(status_changes) - 10} more")
+
+    summary = {"matched": len(both), "compared": len(deltas),
+               "status_changes": len(status_changes), "median_pct": None,
+               "old_best_tg": None, "new_best_tg": None,
+               "old_winner_still_wins": None}
+
+    if deltas:
+        deltas.sort(key=lambda t: t[0])
+        pcts = [d[0] for d in deltas]
+        n = len(pcts)
+        med = pcts[n // 2] if n % 2 else (pcts[n // 2 - 1] + pcts[n // 2]) / 2
+        improved = sum(1 for p in pcts if p > 0.02)
+        regressed = sum(1 for p in pcts if p < -0.02)
+        summary.update(median_pct=med)
+        print(f"\n  tg over the {n} config(s) OK in both: median {med:+.1%}, "
+              f"{improved} improved / {regressed} regressed (beyond ±2%)")
+        worst = [d for d in deltas[:5] if d[0] < -0.02]
+        best = [d for d in reversed(deltas[-5:]) if d[0] > 0.02]
+        for label, picks in (("largest regressions", worst),
+                             ("largest improvements", best)):
+            if picks:
+                print(f"  {label}:")
+                for p, k, o, nw in picks:
+                    print(f"    {p:+7.1%}  tg {o['tg_tps']:6.1f} -> {nw['tg_tps']:6.1f}"
+                          f"  (pp {o['pp_tps']:.0f} -> {nw['pp_tps']:.0f})  {cfgstr(k)}")
+
+    old_ok = [r for r in old_i.values() if okrow(r)]
+    new_ok = [r for r in new_i.values() if okrow(r)]
+    if old_ok and new_ok:
+        ob = max(old_ok, key=lambda r: r["tg_tps"])
+        nb = max(new_ok, key=lambda r: r["tg_tps"])
+        ko = tuple(str(ob.get(c, "")) for c in common)
+        kn = tuple(str(nb.get(c, "")) for c in common)
+        summary.update(old_best_tg=ob["tg_tps"], new_best_tg=nb["tg_tps"],
+                       old_winner_still_wins=(ko == kn))
+        print(f"\n  best OK config: old {ob['tg_tps']:.1f} tg t/s -> "
+              f"new {nb['tg_tps']:.1f} tg t/s")
+        if ko == kn:
+            print(f"  old winner still wins: {cfgstr(kn)}")
+        else:
+            now = f"{new_i[ko]['tg_tps']:.1f} tg t/s" if ko in new_i \
+                  else "not measured in new"
+            print(f"  old winner ({cfgstr(ko)}): {now}")
+            print(f"  NEW winner: {cfgstr(kn)}")
+    return summary
 
 
 def build_child_argv(args, cfg: Config, factors: dict, results_path: Path,
@@ -2309,6 +2523,11 @@ def main():
     ap.add_argument("--ctx-size", "-c", type=int, default=None,
                     help="tune at a FIXED context size (like llama.cpp -c): "
                          "shorthand for --min-context N --max-context N")
+    ap.add_argument("--diff", nargs=2, type=Path, metavar=("OLD.csv", "NEW.csv"),
+                    help="compare two results CSVs (e.g. before/after a llama.cpp "
+                         "upgrade): per-config tg deltas over the factor columns "
+                         "both share, status changes, and whether the old winner "
+                         "still wins. Needs no model or GPU; exits after the report")
     ap.add_argument("--driver", choices=["bench", "server"], default=None,
                     help="benchmark driver (default: from profile). 'server' "
                          "measures real generation incl. MTP and concurrency")
@@ -2445,8 +2664,10 @@ def main():
 
     if args.selftest:
         sys.exit(0 if selftest() else 1)
+    if args.diff:
+        sys.exit(0 if diff_results(*args.diff) is not None else 1)
     if not args.model:
-        ap.error("model path is required (or use --selftest)")
+        ap.error("model path is required (or use --selftest / --diff)")
     if not args.model.exists():
         ap.error(f"model not found: {args.model}")
 
@@ -2885,27 +3106,7 @@ def main():
         journal.close()
     print(f"\nwrote {args.results}")
 
-    # Fold in rows from earlier results files (--merge-results, e.g. previous
-    # --iterate passes) so the report/picks/Pareto/probe consider every config
-    # ever measured — the final answer can then never be worse than an earlier
-    # pass's best. Main-effects/confirm stay on THIS run's balanced design
-    # (the analyzer needs the array structure, and merged rows would skew it).
-    all_rows = list(rows)
-    for mi, mpath in enumerate(args.merge_results, 1):
-        prev = load_results_csv(mpath, cfg.factors)
-        m = re.search(r"\.(pass\d+)$", mpath.stem)
-        tag = m.group(1) if m else f"merge{mi}"
-        added = 0
-        for r in prev:
-            if not all(str(r.get(k, "")) != "" for k in cfg.factors):
-                continue               # foreign CSV missing a factor column
-            # re-score under the CURRENT --score mode (same rule as --resume)
-            r["eff_tps"] = objective_tps(cfg, r["pp_tps"], r["tg_tps"])
-            r["run_id"] = f"{tag}:{r.get('run_id', '')}"
-            all_rows.append(r)
-            added += 1
-        print(f"merged {added} row(s) from {mpath.name} into the report"
-              if added else f"merge: no usable rows in {mpath}")
+    all_rows = merge_result_rows(cfg, rows, args.merge_results)
 
     report(cfg, all_rows)
     opt, predicted = taguchi_effects(cfg, exp, rows)
