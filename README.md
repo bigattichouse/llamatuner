@@ -256,7 +256,9 @@ model, so you know what to expect from each section.
 ```
 
 **The three picks** — each with a copy-paste `llama-server` command, its `-c`
-sized to what the sweep actually verified for that config:
+sized to what the sweep actually verified for that config, and a prefill-cost
+estimate for that `-c`. With `--verify-picks` (default on) each pick also carries
+a `verified: median of N measurements (spread X%)` line:
 
 ```
 RESULTS: 72/72 configs succeeded
@@ -471,7 +473,7 @@ python3 llama-optimize.py MODEL.gguf [options]
   --no-mtp           don't add draft-mtp flags to the server command
   --no-probe         skip the max-context probe (runs by default: binary-searches
                      the physical context ceiling for the furthest-reaching config,
-                     then prints a ready command at ~90% of it)
+                     reported as PROBED CEILING with a ready command at ~90% of it)
   --no-shuffle       run in array order (default: randomized, see below)
   --no-thermal-wait  disable the default settle between runs (waits until GPU temp
                      falls back near its idle baseline; keeps runs comparable)
@@ -651,7 +653,9 @@ python3 llama-optimize.py model-UD.gguf --run --driver server \
 - **Trustworthy measurement** — realistic prompts, warmup + rep averaging,
   **randomized run order** + a default **thermal settle** between runs (wait for
   the GPU to return near its idle temp; `--cooldown` as the sensorless fallback),
-  with each row's start temp recorded (`temp_c`).
+  with each row's start temp recorded (`temp_c`); **pick verification**
+  (`--verify-picks`, default on) re-measures the final picks and reports medians
+  with the observed spread, so the headline number isn't one lucky rep.
 - **Robust** — incremental save + `--resume`; **crash journal** so a config that
   reboots the machine is skipped, not retried (`--retry-crashed` to override);
   clear errors; `--selftest` (no GPU); max-context probe by default (`--no-probe` to skip).
@@ -660,7 +664,9 @@ python3 llama-optimize.py model-UD.gguf --run --driver server \
 
 The DOE funnel is feature-complete for tuning: **Morris** screens which knobs matter
 and flags interactions (`σ`), **Taguchi + `--iterate`** find the optimum, and
-**`--confirm`** verifies it. Nothing pressing is planned.
+**`--verify-picks`/`--confirm`** verify the result. Remaining improvement ideas
+(per-rep noise capture, predictive OOM pruning, multi-GPU factors, measured TTFT)
+are tracked in [`ROADMAP.md`](ROADMAP.md).
 
 *Considered and dropped:* **Sobol variance attribution.** It would quantify
 interaction strength precisely, but that's diagnostic, not actionable — it never

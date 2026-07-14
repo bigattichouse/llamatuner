@@ -204,6 +204,8 @@ ceiling probe all settle the same way, and every sweep row records its start
 temperature (`temp_c` in the CSV) so thermal comparability is checkable after the fact
 rather than assumed. This is a *cool-start* baseline — it
 buys comparability (a correct winner) cheaply; it does not by itself make the absolute
-t/s match sustained-hot reality. The remaining honest step is an **empirical
-confirmation** of the top few candidates re-measured head-to-head, rather than an
-additive-model extrapolation.
+t/s match sustained-hot reality. Closing that gap is **pick
+verification** (`--verify-picks`, default on): the final pick candidates are
+re-measured head-to-head after the sweep and reported as medians with their
+observed spread, rather than trusting one measurement or an additive-model
+extrapolation.

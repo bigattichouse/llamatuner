@@ -2934,13 +2934,6 @@ def main():
                          "default (no flag) is non-thinking / short answers")
     ap.add_argument("--timeout", type=int, default=1200,
                     help="per-run timeout in seconds")
-    ap.add_argument("--verify-picks", type=int, default=None, metavar="R",
-                    help="re-measure each pick candidate R extra times and report "
-                         "the MEDIAN of all its measurements (default: 2, or "
-                         "--quick=0/--full=3; 0 disables) — guards the headline "
-                         "numbers against thermal/run-to-run noise. Medians persist "
-                         "to <results>.verify.json for --report-only; the CSV keeps "
-                         "the raw sweep measurements")
     ap.add_argument("--use-case", choices=list(USE_CASES), default=None,
                     metavar="{app,single,agents,multi-user}",
                     help="high-level runbook that bundles driver+profile+concurrency: "
@@ -2949,6 +2942,13 @@ def main():
                          "agents, long tool-use prompts), multi-user (many concurrent "
                          "chat users). --driver/--profile/--parallel override the "
                          "runbook.")
+    ap.add_argument("--verify-picks", type=int, default=None, metavar="R",
+                    help="re-measure each pick candidate R extra times and report "
+                         "the MEDIAN of all its measurements (default: 2, or "
+                         "--quick=0/--full=3; 0 disables) — guards the headline "
+                         "numbers against thermal/run-to-run noise. Medians persist "
+                         "to <results>.verify.json for --report-only; the CSV keeps "
+                         "the raw sweep measurements")
     ap.add_argument("--vram", action="store_true",
                     help="measure actual peak VRAM used per run (polls "
                          "rocm-smi/nvidia-smi); records vram_mib and draws the "
