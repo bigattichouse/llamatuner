@@ -26,6 +26,7 @@ import random
 import re
 import shlex
 import shutil
+import statistics
 import struct
 import socket
 import subprocess
@@ -1319,6 +1320,25 @@ def kv_downgrade_hint(r: dict) -> str | None:
             "headroom, at a small decode-speed cost.")
 
 
+def ttft_note(r: dict, ctx: int) -> str | None:
+    """One-line prefill-cost estimate for the emitted -c: filling the context
+    at this config's measured pp speed. A giant -c can mean many minutes before
+    the first token — great tg alone doesn't make a config interactive — so the
+    cost is stated right where the command gets copied. Prefill slows somewhat
+    with depth, so treat the estimate as optimistic."""
+    try:
+        pp = float(r.get("pp_tps") or 0)
+    except (TypeError, ValueError):
+        return None
+    if pp <= 0 or ctx <= 0:
+        return None
+    note = (f"prefill cost: a full {ctx}-token prompt ≈ {fmt_dur(ctx / pp)} "
+            f"to first token at pp={pp:.0f} t/s")
+    if ctx > 16384:
+        note += f" (an 8k prompt ≈ {fmt_dur(8192 / pp)})"
+    return note
+
+
 def report(cfg: Config, rows: list[dict], probe: dict | None = None):
     ok = [r for r in rows if r["status"] == "OK"]
     print("\n" + "=" * 70)
@@ -1360,13 +1380,17 @@ def report(cfg: Config, rows: list[dict], probe: dict | None = None):
         print(f"  {cfg.score}={score_of(r):.1f} t/s  ({raw})  "
               f"depth={r['n_depth']}  ngl={r['ngl']}  "
               f"t={r['threads']}  kv={r['kv_type']}  ub={r['ubatch']}")
+        if r.get("verify_n"):
+            print(f"  verified: median of {r['verify_n']} measurements "
+                  f"(spread {r['spread_pct']:.0f}%)")
         # size context to what the sweep verified for this config, floored at
         # the usable floor where evidence allows (see recommended_ctx); a
         # bigger -c can OOM at launch.
         ctx = recommended_ctx(cfg, r, verified_depth_of(cfg, rows, r))
         print("  suggested llama-server command:")
         print("    " + server_command(cfg, r, ctx))
-        for extra in (kv_downgrade_hint(r), ctx_floor_note(cfg, r, ctx)):
+        for extra in (kv_downgrade_hint(r), ctx_floor_note(cfg, r, ctx),
+                      ttft_note(r, ctx)):
             if extra:
                 print("  " + extra)
 
@@ -1386,9 +1410,9 @@ def report(cfg: Config, rows: list[dict], probe: dict | None = None):
         print(f"  suggested llama-server command (-c {probe['safe_ctx']}, "
               "~10% headroom under the ceiling):")
         print("    " + server_command(cfg, r, probe["safe_ctx"]))
-        hint = kv_downgrade_hint(r)
-        if hint:
-            print("  " + hint)
+        for extra in (kv_downgrade_hint(r), ttft_note(r, probe["safe_ctx"])):
+            if extra:
+                print("  " + extra)
 
     kind = "effective" if cfg.score == "eff" else "generation"
     print(f"\n### Pareto frontier (context vs {kind} t/s)")
@@ -1580,8 +1604,11 @@ def write_html_report(cfg: Config, rows: list[dict], path: Path,
             return f"<div class=card><h3>{esc(title)}</h3><p class=muted>none met the constraint</p></div>"
         ctx = recommended_ctx(cfg, r, verified_depth_of(cfg, rows, r))
         cmd = esc(server_command(cfg, r, ctx))
+        ver = (f"verified: median of {r['verify_n']} measurements "
+               f"(spread {r['spread_pct']:.0f}%)" if r.get("verify_n") else None)
         tip = "".join(f"<div class=muted>{esc(x)}</div>"
-                      for x in (kv_downgrade_hint(r), ctx_floor_note(cfg, r, ctx)) if x)
+                      for x in (ver, kv_downgrade_hint(r),
+                                ctx_floor_note(cfg, r, ctx), ttft_note(r, ctx)) if x)
         raw = ((f"tg {r['tg_tps']:.1f} · " if cfg.score == "eff" else "")
                + f"pp {r['pp_tps']:.1f}")
         return (f"<div class=card><h3>{esc(title)}</h3>"
@@ -1606,7 +1633,10 @@ def write_html_report(cfg: Config, rows: list[dict], path: Path,
             f"ub {esc(r['ubatch'])} · t {esc(r['threads'])}</div>"
             f"<pre>{cmd}</pre>"
             f"<div class=muted>largest context that loads (binary search); "
-            f"speed there is a single measurement, not swept</div></div>")
+            f"speed there is a single measurement, not swept</div>"
+            + "".join(f"<div class=muted>{esc(x)}</div>"
+                      for x in (ttft_note(r, probe["safe_ctx"]),) if x)
+            + "</div>")
 
     # main-effects bars, factors ordered by range (impact) descending
     effects = []
@@ -1816,6 +1846,82 @@ def run_probe_stage(cfg: Config, all_rows: list[dict], timeout: int,
     safe = max(4096, int(depth * 0.9) // 1024 * 1024)
     return {"row": base_row, "depth": depth, "tg_tps": tps,
             "safe_ctx": safe, "at_cap": depth >= cap}
+
+
+# ---------------------------------------------------------------------------
+# Stage-3: pick verification (medians beat lucky reps)
+# ---------------------------------------------------------------------------
+def config_key(cfg: Config, r: dict) -> str:
+    """A config's identity across rows and sidecars: its factor values joined
+    into one string (JSON-object-key friendly)."""
+    return "|".join(f"{k}={r.get(k, '')}" for k in cfg.factors)
+
+
+def verify_sidecar(results: Path) -> Path:
+    """Where a sweep persists its pick-verification medians (JSON) so
+    --report-only can re-apply them without a GPU."""
+    return Path(str(results) + ".verify.json")
+
+
+def verify_picks(cfg: Config, all_rows: list[dict], reps: int, timeout: int,
+                 thermal_baseline: float | None) -> dict | None:
+    """Re-measure each pick candidate `reps` extra times and settle on the
+    median of all its measurements. Sweep rows are single measurements carrying
+    thermal/run-to-run noise (±25% observed on hot GPUs), and picks made from
+    exact scores crown whichever config got the lucky rep — medians make the
+    headline numbers reproducible. Returns {config_key: {tg_tps, pp_tps, n,
+    spread_pct}} for apply_verification(), or None if nothing to verify."""
+    fastest, balanced, longest = pick_recommendations(cfg, all_rows)
+    cands, seen = [], set()
+    for r in (fastest, balanced, longest):
+        if r is None:
+            continue
+        k = config_key(cfg, r)
+        if k not in seen:
+            seen.add(k)
+            cands.append((k, r))
+    if not cands:
+        return None
+    print(f"\n### Verifying picks  ({len(cands)} config(s) x {reps} extra "
+          f"measurement(s); the median becomes the reported number)")
+    out = {}
+    for k, r in cands:
+        f = {name: str(r[name]) for name in cfg.factors}
+        tgs, pps = [float(r["tg_tps"])], [float(r["pp_tps"])]
+        for i in range(reps):
+            wait_until_cool(thermal_baseline)
+            prefix = (f"verify ngl={f.get('ngl', '?')} "
+                      f"depth={f.get('n_depth', '?')} [{i + 1}/{reps}]")
+            res = with_ticker(prefix, timeout,
+                              lambda ff=f: drive_one(cfg, ff, timeout))
+            if res["status"] == "OK" and res["tg_tps"] > 0:
+                tgs.append(res["tg_tps"])
+                pps.append(res["pp_tps"])
+            else:
+                print(f"  (verify rep failed: {res['status']} — keeping the "
+                      "other measurements)")
+        med_tg = statistics.median(tgs)
+        spread = (max(tgs) - min(tgs)) / med_tg * 100 if med_tg > 0 else 0.0
+        print(f"  ngl={f.get('ngl', '?')} depth={f.get('n_depth', '?')}: "
+              f"tg {float(r['tg_tps']):.1f} -> median {med_tg:.1f} t/s "
+              f"({len(tgs)} measurements, spread {spread:.0f}%)")
+        out[k] = {"tg_tps": med_tg, "pp_tps": statistics.median(pps),
+                  "n": len(tgs), "spread_pct": round(spread, 1)}
+    return out
+
+
+def apply_verification(cfg: Config, rows: list[dict], verify: dict):
+    """Overwrite each verified config's measured numbers with its median (and
+    tag the row: verify_n / spread_pct) so the picks, Pareto, and report all
+    speak the verified value. The results CSV keeps the raw single
+    measurements; the medians live in the .verify.json sidecar."""
+    for r in rows:
+        v = verify.get(config_key(cfg, r))
+        if not v:
+            continue
+        r["tg_tps"], r["pp_tps"] = v["tg_tps"], v["pp_tps"]
+        r["eff_tps"] = objective_tps(cfg, r["pp_tps"], r["tg_tps"])
+        r["verify_n"], r["spread_pct"] = v["n"], v["spread_pct"]
 
 
 # ---------------------------------------------------------------------------
@@ -2141,6 +2247,51 @@ def selftest() -> bool:
         mtxt = ("Factor  mu*  sigma  note\n------  ----  -----  ----\n"
                 "ubatch  96  0\nngl  32  0.001  \n\nRanked by mu* ...\n")
         assert parse_morris_analyze(mtxt) == [("ubatch", 96.0, 0.0), ("ngl", 32.0, 0.001)]
+
+        # ttft note: prefill-cost estimate on emitted commands
+        n = ttft_note({"pp_tps": 100.0}, 235520)
+        assert n and "39m" in n and "8k prompt" in n
+        assert "8k prompt" not in ttft_note({"pp_tps": 100.0}, 8192)
+        assert ttft_note({"pp_tps": 0}, 8192) is None
+
+        # sidecar naming (probe / verify persist next to the results CSV)
+        assert probe_sidecar(Path("r/x.csv")).name == "x.csv.probe.json"
+        assert verify_sidecar(Path("r/x.csv")).name == "x.csv.verify.json"
+
+        # pick verification: medians overwrite the row, keyed by config
+        cfg_pv = Config(model=Path("m.gguf"), llama_bench=Path("lb"), array="L25",
+                        ctx_floor=8192,
+                        factors={"ngl": ["58"], "n_depth": ["32768"],
+                                 "threads": ["5"], "kv_type": ["q8_0"],
+                                 "ubatch": ["512"]})
+        pv_rows = [{"run_id": "1", "ngl": "58", "n_depth": "32768",
+                    "threads": "5", "kv_type": "q8_0", "ubatch": "512",
+                    "status": "OK", "pp_tps": 120.0, "tg_tps": 10.8,
+                    "eff_tps": 10.8}]
+        apply_verification(cfg_pv, pv_rows,
+                           {config_key(cfg_pv, pv_rows[0]):
+                            {"tg_tps": 8.9, "pp_tps": 118.0,
+                             "n": 3, "spread_pct": 25.0}})
+        assert pv_rows[0]["tg_tps"] == 8.9 and pv_rows[0]["verify_n"] == 3
+        assert pv_rows[0]["eff_tps"] == 8.9      # re-scored under --score tg
+
+        # probe + verification render in the terminal report and the HTML card
+        pv_probe = {"row": pv_rows[0], "depth": 262144, "tg_tps": 6.6,
+                    "safe_ctx": 235520, "at_cap": True}
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            report(cfg_pv, pv_rows, pv_probe)
+        rout = buf.getvalue()
+        assert "PROBED CEILING" in rout and "-c 235520" in rout
+        assert "median of 3 measurements" in rout and "prefill cost" in rout
+        with tempfile.TemporaryDirectory() as td:
+            hp = Path(td) / "r.html"
+            with contextlib.redirect_stdout(io.StringIO()):
+                write_html_report(cfg_pv, pv_rows, hp, pv_probe)
+                h = hp.read_text()
+                assert "Probed ceiling" in h and "262,144" in h
+                write_html_report(cfg_pv, pv_rows, hp)
+            assert "Probed ceiling" not in hp.read_text()
     except AssertionError as e:
         print(f"selftest FAILED: {e}")
         return False
@@ -2253,6 +2404,13 @@ def report_from_results(cfg: Config, args, ap):
     for r in rows:      # re-score under the CURRENT --score mode
         r["eff_tps"] = objective_tps(cfg, r["pp_tps"], r["tg_tps"])
     all_rows = merge_result_rows(cfg, rows, args.merge_results)
+    vf = verify_sidecar(path)
+    if vf.exists():
+        try:
+            apply_verification(cfg, all_rows, json.loads(vf.read_text()))
+            print(f"applied pick-verification medians from {vf.name}")
+        except (json.JSONDecodeError, OSError) as e:
+            print(f"(ignoring unreadable {vf.name}: {e})")
     probe = None
     pf = probe_sidecar(path)
     if pf.exists():
@@ -2424,8 +2582,10 @@ def build_child_argv(args, cfg: Config, factors: dict, results_path: Path,
             argv += ["--html", str(args.html)]
         if args.no_probe:
             argv.append("--no-probe")
+        argv += ["--verify-picks", str(args.verify_picks)]
     else:
         argv.append("--no-probe")  # only probe on the final pass
+        argv += ["--verify-picks", "0"]  # only verify final picks
     return argv
 
 
@@ -2774,6 +2934,13 @@ def main():
                          "default (no flag) is non-thinking / short answers")
     ap.add_argument("--timeout", type=int, default=1200,
                     help="per-run timeout in seconds")
+    ap.add_argument("--verify-picks", type=int, default=None, metavar="R",
+                    help="re-measure each pick candidate R extra times and report "
+                         "the MEDIAN of all its measurements (default: 2, or "
+                         "--quick=0/--full=3; 0 disables) — guards the headline "
+                         "numbers against thermal/run-to-run noise. Medians persist "
+                         "to <results>.verify.json for --report-only; the CSV keeps "
+                         "the raw sweep measurements")
     ap.add_argument("--use-case", choices=list(USE_CASES), default=None,
                     metavar="{app,single,agents,multi-user}",
                     help="high-level runbook that bundles driver+profile+concurrency: "
@@ -2846,6 +3013,8 @@ def main():
     parallel = (args.parallel if args.parallel is not None
                 else uc.get("parallel", prof.get("parallel", 1)))
     reps = args.reps if args.reps is not None else (1 if args.quick else 5 if args.full else BENCH_REPS)
+    if args.verify_picks is None:
+        args.verify_picks = 0 if args.quick else 3 if args.full else 2
 
     llama_bench = resolve_binary("llama-bench", args.llama_bench, args.llama_cpp)
     llama_server = resolve_binary("llama-server", args.llama_server, args.llama_cpp)
@@ -3245,6 +3414,17 @@ def main():
     print(f"\nwrote {args.results}")
 
     all_rows = merge_result_rows(cfg, rows, args.merge_results)
+
+    # Stage-3 verification: the pick candidates get re-measured and their
+    # medians become the reported numbers (before the probe, so the probe's
+    # base-config choice also sees the settled scores). Persisted to a sidecar
+    # so --report-only re-applies it; the CSV keeps the raw measurements.
+    if args.verify_picks > 0:
+        verify = verify_picks(cfg, all_rows, args.verify_picks, args.timeout,
+                              thermal_baseline)
+        if verify:
+            verify_sidecar(args.results).write_text(json.dumps(verify, indent=1))
+            apply_verification(cfg, all_rows, verify)
 
     # Stage-2 probe runs BEFORE the report so its ceiling appears alongside
     # the picks (fixed context via --ctx-size: no ceiling search). The result

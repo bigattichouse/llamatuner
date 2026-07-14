@@ -266,6 +266,7 @@ RESULTS: 72/72 configs succeeded
   suggested llama-server command:
     ./llama-server -m gemma-4-31B-it-UD-Q6_K_XL.gguf -c 33792 -fa 1 -ngl 60 \
       -t 6 -ctk q8_0 -ctv q8_0 -ub 512 -nkvo --poll 50 -b 2048
+  prefill cost: a full 33792-token prompt ≈ 4m12s to first token at pp=134 t/s (an 8k prompt ≈ 1m01s)
 
 ### BALANCED (best with context >= 8192)
   tg=10.8 t/s  (pp=134.1)  depth=32768  ngl=60  t=6  kv=q8_0  ub=512
@@ -505,6 +506,10 @@ python3 llama-optimize.py MODEL.gguf [options]
   --use-case U       runbook that bundles driver+profile+concurrency:
                      app | single | agents | multi-user (see Use cases above).
                      --driver/--profile/--parallel override the runbook.
+  --verify-picks R   re-measure each pick candidate R extra times and report the
+                     median of all its measurements (default: 2, --quick=0/--full=3;
+                     0 disables) — guards the headline numbers against thermal /
+                     run-to-run noise; medians persist to <results>.verify.json
   --vram             measure actual peak VRAM per run (polls rocm-smi/nvidia-smi);
                      records vram_mib and overlays the VRAM curve + physical
                      ceiling on the Pareto chart

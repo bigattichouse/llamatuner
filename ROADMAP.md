@@ -3,10 +3,15 @@
 Improvement ideas, roughly ordered by expected value. Items get checked off (and
 their design notes trimmed) as they land.
 
-## 1. Noise-aware picks
+## 1. Noise-aware picks — partially done
 
-`pick_recommendations` and the Pareto frontier treat scores as exact, but with
-`--quick` (1 rep) two configs 2% apart are a coin flip.
+Landed: `--verify-picks` (default on, 2 extra reps; `--full`=3) re-measures the
+pick candidates after the sweep and reports the **median** of all measurements,
+with the observed spread printed on the pick (persisted to
+`<results>.verify.json` so `--report-only` re-applies it). Motivated by a real
+sweep where the same config measured 10.6 vs 7.7 tg t/s (~27% swing, thermal).
+
+Remaining:
 
 - llama-bench `-o json` already reports `stddev_ts` per test — capture it into
   the CSV as `pp_std`/`tg_std`; have the server driver keep per-rep samples and
@@ -15,9 +20,7 @@ their design notes trimmed) as they land.
   ~2σ of the combined noise).
 - Tie-breaking: among tied configs prefer more context, then lower measured
   VRAM, instead of whichever got the lucky rep.
-
-This is the item most likely to change a real recommendation. Validate against
-a real full-sweep CSV (needs per-rep spread in the data, not synthetic rows).
+- Use the recorded `temp_c` to flag rows measured well above the idle baseline.
 
 ## 2. Predictive OOM pruning
 
@@ -48,12 +51,16 @@ FACTORS registry — the biggest untuned lever on 2+-card boxes.
 factor columns both files share, status changes, and whether the old winner
 still wins.
 
-## 5. Time-to-first-token metric
+## 5. Time-to-first-token metric — partially done
 
-The server driver times the whole request; splitting out TTFT would matter for
-interactive use where great `tg` with slow prefill still *feels* worse.
+Landed: every suggested command now prints a prefill-cost estimate — filling
+the emitted `-c` at that config's measured `pp` speed, plus an 8k-prompt figure
+(e.g. the 235k max-context command: ≈32 min to first token). Derived, not
+measured.
 
-- Report alongside `pp`/`tg` (timestamp of first streamed token).
+Remaining (true measured TTFT):
+
+- Report alongside `pp`/`tg` (timestamp of first streamed token, server driver).
 - Not a new objective initially; could later back a `--score ttft`.
 
 ## 6. ~~CI for the selftest~~ — done
