@@ -10,7 +10,8 @@ speed-vs-context Pareto frontier. The DOE engines (Taguchi + Morris) come from t
 
 It works on **AMD (ROCm) or NVIDIA (CUDA)**, tunes **every knob llama.cpp exposes**
 (see the [knob reference](#knob-reference-one-stop-shop)), can measure **MTP /
-speculative decoding** and **multi-user concurrency** via a server driver, and is
+speculative decoding**, **ngram self-speculation** (`--ngram`), and
+**multi-user concurrency** via a server driver, and is
 **crash-safe** — a setting that reboots the box won't be retried into a loop.
 
 ```bash
@@ -133,13 +134,13 @@ Swept by default (auto-scaled to your hardware and model):
 | MoE expert offload | `-ncmoe`   | `0 .. n_layers` (5 levels)             | **MoE models** (replaces `-ot`): how many layers keep experts on CPU |
 | NUMA policy   | `--numa`         | `distribute, isolate`                  | **multi-NUMA-node boxes only** (inert on one node) |
 | Prefill threads | `-tb`          | same levels as `-t`                    | **server driver**: decode vs prefill thread split |
+| ngram on/off   | `--spec-type <variant>` | `none, ng-simple, ng-mod, ng-map-k, ng-map-k4v` | **server driver, --ngram**: which ngram pattern-matching variant to use |
+| ngram draft len | `--spec-draft-n-max` | `1..16`                              | **server driver, --ngram**: shared draft length for ngram speculation |
+| ngram map params | `--spec-ngram-*-size-n/m, -min-hits` | `4..24 / 8..64 / 1..5`  | **server driver, --ngram**: lookup n-gram, draft m-gram, and min hit thresholds |
+| ngram mod params | `--spec-ngram-mod-n-match/min/max` | `8..48 / 16..96 / 32..128` | **server driver, --ngram**: ngram-mod hasher lookup length and range |
 | MTP on/off    | `--spec-type draft-mtp` | `1, 0`                          | **MTP models, server driver**: measures what speculative decoding actually buys |
 | MTP draft len | `--spec-draft-n-max` / `-min` | `1..6` / `1, 2`           | **MTP models, server driver**: speculative draft lengths |
 | MTP acceptance | `--spec-draft-p-min` / `-p-split` | `0.0..0.9` / `0.1..0.5` | **MTP models, server driver**: draft acceptance thresholds |
-
-A model that ships an MTP/NextN head (e.g. Unsloth Dynamic quants) **auto-switches to
-the server driver** so the whole MTP surface is measured, not just emitted —
-llama-bench can't do speculative decoding (`--driver bench` or `--no-mtp` overrides).
 
 The KV factor is quality-gated: `--min-kv` (default `q8_0`, near-lossless) drops the
 lossier levels so the tool never recommends a KV type that degrades output over long
@@ -478,6 +479,9 @@ python3 llama-optimize.py MODEL.gguf [options]
   --n-gen N          generated tokens per measurement (default: from profile)
   --n-prompt N       prompt tokens per measurement (default: from profile)
   --no-mtp           don't add draft-mtp flags to the server command
+  --ngram            enable ngram self-speculative decoding sweep (server only):
+                     tests all ngram variants + their tunable parameters to find
+                     the optimal pattern-matching speculation for your workload
   --no-probe         skip the max-context probe (runs by default: binary-searches
                      the physical context ceiling for the furthest-reaching config,
                      reported as PROBED CEILING with a ready command at ~90% of it)
@@ -508,7 +512,8 @@ python3 llama-optimize.py MODEL.gguf [options]
   --selftest         run offline logic checks and exit (no GPU, no model)
   --server-start-timeout SECS  give up on a config if llama-server doesn't load
                      in this long (default: 180; also fails fast if it dies)
-  --spec-draft-n-max N  MTP draft tokens for the server command (default: 2)
+  --spec-draft-n-max N  draft tokens for speculative decoding, shared by MTP and
+                     ngram (default: 2; --ngram overrides to 16 when not swept)
   --thinking         tune for reasoning workloads (long decode, n_gen~2048);
                      default is non-thinking / short answers
   --timeout SECS     per-run timeout (default: 1200)
@@ -575,19 +580,26 @@ registry in `llama-optimize.py`.
 | `ot` | `-ot` | both | cat | swept¹ | per-tensor placement — the VRAM-fit lever (named patterns below) |
 | `threads_batch` | `-tb` | server | num | swept | CPU threads for prompt processing |
 | `parallel` | `--parallel` | server | num | opt-in | concurrent request streams (multi) |
+| `ngram` | `--spec-type <variant>` | server | cat | swept⁴ | ngram self-speculation variant: none, ngram-simple, ngram-mod, ngram-map-k, ngram-map-k4v |
+| `spec_n_max` | `--spec-draft-n-max` | server | num | swept³ ⁴ | max draft tokens (shared MTP + ngram) |
+| `ngram_simple_size_n` | `--spec-ngram-simple-size-n` | server | num | swept⁴ | lookup n-gram length (ngram-simple) |
+| `ngram_simple_size_m` | `--spec-ngram-simple-size-m` | server | num | swept⁴ | draft m-gram length (ngram-simple) |
+| `ngram_simple_min_hits` | `--spec-ngram-simple-min-hits` | server | num | swept⁴ | min hits to draft (ngram-simple) |
+| `ngram_map_k_size_n/m, _min_hits` | `--spec-ngram-map-k-*` | server | num | swept⁴ | same structure for ngram-map-k |
+| `ngram_map_k4v_size_n/m, _min_hits` | `--spec-ngram-map-k4v-*` | server | num | swept⁴ | same structure for ngram-map-k4v |
+| `ngram_mod_n_match/min/max` | `--spec-ngram-mod-n-*` | server | num | swept⁴ | ngram-mod hasher: lookup length, min/max range |
 | `mtp` | `--spec-type draft-mtp` | server | cat | swept³ | speculative decoding via the model's MTP head, on/off |
-| `spec_n_max` | `--spec-draft-n-max` | server | num | swept³ | MTP draft tokens (max) |
 | `spec_n_min` | `--spec-draft-n-min` | server | num | swept³ | MTP draft tokens (min) |
 | `spec_p_min` | `--spec-draft-p-min` | server | float | swept³ | MTP acceptance-probability threshold |
 | `spec_p_split` | `--spec-draft-p-split` | server | float | swept³ | MTP split probability |
 | `rope_scaling` | `--rope-scaling` | server | cat | opt-in | RoPE scaling: none/linear/yarn |
 | `yarn_factor` | `--yarn-ext-factor` | server | float | opt-in | YaRN extrapolation (context **beyond** native) |
-
 ¹ `ncmoe` swept for MoE models, `ot` for dense ones (the same placement lever, per
 architecture).  ² fixed on unless swept (precondition for KV-quant; pair with
 `--min-kv f16`).  ³ swept when the model ships an MTP/NextN head — such models also
 auto-switch to the server driver so the effect is measured (`--no-mtp` disables).
-⁴ swept only on machines with multiple NUMA nodes (inert on one node).
+⁴ swept when `--ngram` is passed (server driver auto-switches).  ngram needs no
+draft model — it pattern-matches from the token history.
 
 **`-ot` named patterns** (translate to real tensor regexes): `none`, `ffn_cpu`,
 `ffn_up_cpu`, `exps_cpu`, `attn_cpu`.
@@ -604,7 +616,9 @@ python3 llama-optimize.py model-UD.gguf --run --driver server \
 # gfx906 / ROCm environment knobs (the "10-30%")
 python3 llama-optimize.py model.gguf --run \
   --env GGML_CUDA_FORCE_MMQ=0,1 --env GGML_CUDA_FORCE_CUBLAS=0,1
-```
+
+# tune the ngram self-speculation surface (server driver)
+python3 llama-optimize.py model.gguf --run --driver server --ngram
 
 **Notes.** MTP/spec and concurrency knobs need `--driver server` (llama-bench can't
 do them). Keep the number of levels-per-factor uniform where you can — mixing 2- and
@@ -618,14 +632,14 @@ finer grid and keeps the top levels of categorical ones.
 - **`bench`** (default) — `llama-bench`. Fast, measures raw prefill/decode. Cannot
   do speculative decoding or real concurrency.
 - **`server`** — launches `llama-server`, drives real generation over HTTP, and
-  measures actual tokens/sec. This is the **only** way to measure **MTP /
-  speculative decoding** (it auto-adds `--spec-type draft-mtp` for models with a
-  NextN head) and **multi-user concurrency** (`--parallel N`, aggregate
-  throughput). The `multi` profile selects it automatically; force it on any
-  profile with `--driver server` (e.g. to measure MTP on a single-user workload).
-  Configs that share load-time params (everything except context depth) **reuse a
-  single server** sized to the group's max context, so it doesn't reload the model
-  for every run.
+  measures actual tokens/sec. This is the **only** way to measure **MTP /**
+  **speculative decoding** (auto-adds `--spec-type draft-mtp` for models with an
+  MTP/NextN head; add `--ngram` for ngram-based self-speculation) and
+  **multi-user concurrency** (`--parallel N`, aggregate throughput). The `multi`
+  profile selects it automatically; force it on any profile with `--driver server`
+  (e.g. to measure MTP on a single-user workload).  Configs that share load-time
+  params (everything except context depth) **reuse a single server** sized to the
+  group's max context, so it doesn't reload the model for every run.
 
 ```bash
 # measure the real MTP speedup on a single-user workload (UD quant with NextN head)
@@ -645,7 +659,8 @@ python3 llama-optimize.py model-UD.gguf --run --driver server \
   MoE (`expert_count`), MTP (`nextn_predict_layers`), and native context; picks the
   array; generates sensible per-model factor levels. Zero flags required.
 - **Two drivers** — `bench` (fast, raw pp/tg) and `server` (real generation:
-  **measures MTP** and **multi-user concurrency**), with server reuse across runs.
+  **measures MTP, ngram self-speculation, and multi-user concurrency**), with
+  server reuse across runs.
 - **Use-case runbooks** (`--use-case app|single|agents|multi-user`) that bundle
   driver + profile + concurrency, over **workload profiles** (`--profile
   single|agents|multi`) and a selectable objective (`--score`: generation t/s by
@@ -655,8 +670,8 @@ python3 llama-optimize.py model-UD.gguf --run --driver server \
   drop the negligible) → `--iterate N` (auto-refine the survivors) → `--confirm`
   (verify the prediction) → `--html` report.
 - **One-stop knob registry** — every llama.cpp lever is sweepable (`--factor`),
-  including MTP/spec dials, `-ot` placement, CPU affinity, and env vars (`--env`);
-  MoE/MTP knobs auto-enabled by model.
+  including MTP/spec dials, ngram parameters, `-ot` placement, CPU affinity,
+  and env vars (`--env`); MoE/MTP/ngram knobs auto-enabled by model or --ngram.
 - **Trustworthy measurement** — realistic prompts, warmup + rep averaging,
   **randomized run order** + a default **thermal settle** between runs (wait for
   the GPU to return near its idle temp; `--cooldown` as the sensorless fallback),
