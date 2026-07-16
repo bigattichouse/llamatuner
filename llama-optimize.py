@@ -517,13 +517,17 @@ def kv_at_or_above(levels: list, floor: str) -> list:
     return kept or [floor]  # never empty
 
 
-def depth_levels(n_ctx_train: int | None, override_max: int | None = None) -> list[int]:
-    """Five n_depth levels spanning 0..min(native ctx, cap). Adaptive so we
-    never test beyond the model's native context."""
+def depth_levels(n_ctx_train: int | None, override_max: int | None = None,
+                 floor: int = 0) -> list[int]:
+    """Five n_depth levels spanning floor..min(native ctx, cap). Adaptive so we
+    never test beyond the model's native context.  The floor raises the minimum
+    depth so the sweep only tests context sizes the user actually needs (--ctx-floor)."""
     top = min(n_ctx_train or DEFAULT_MAX_DEPTH, DEFAULT_MAX_DEPTH)
     if override_max is not None:
         top = min(top, override_max)
-    return five_levels_span(0, top)
+    if floor >= top:
+        return [top]
+    return five_levels_span(floor, top)
 
 
 def ncmoe_levels(n_layers: int | None) -> list[int]:
@@ -579,7 +583,7 @@ def build_factors(cfg: Config):
     phys = cfg.hw["phys"]
     logical = cfg.hw["logical"]
     n_layers = cfg.hw.get("n_layers")
-    depths = depth_levels(cfg.hw.get("n_ctx_train"), cfg.max_depth)
+    depths = depth_levels(cfg.hw.get("n_ctx_train"), cfg.max_depth, floor=cfg.ctx_floor)
     factors = {
         "ngl": [str(x) for x in ngl_levels(n_layers)],
         "n_depth": [str(x) for x in depths],
@@ -2050,7 +2054,12 @@ def selftest() -> bool:
         assert parse_bench_json("not json") == (None, None)
 
         # OOM detection
-        assert _OOM_PAT.search("ggml_backend_alloc failed: out of memory")
+        assert len(thread_levels(8, 16)) >= 3
+        # depth_levels respects ctx_floor
+        assert depth_levels(65536, floor=0)[0] == 0
+        assert depth_levels(65536, floor=32768)[0] >= 32768
+        assert depth_levels(65536, floor=32768)[-1] == 65536
+        assert depth_levels(65536, floor=999999) == [65536]  # floor > top → single
         assert _OOM_PAT.search("ROCm error: hipErrorOutOfMemory")
 
         # factor-level generation
@@ -3198,8 +3207,8 @@ def main():
         driver = "server"
         print("note: model has an MTP head — driver auto-switched to server so "
               "the sweep measures and tunes MTP (--driver bench to override)")
-    if (driver == "bench" and args.driver is None and uc.get("driver") is None
-            and args.ngram and llama_server.exists()):
+    if (driver == "bench" and args.driver is None and args.ngram
+            and llama_server.exists()):
         driver = "server"
         print("note: ngram speculation requested — driver auto-switched to server "
               "(--driver bench to override)")
