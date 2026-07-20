@@ -37,7 +37,7 @@ import time
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -549,6 +549,8 @@ class Config:
     max_depth: int | None = None  # cap n_depth levels (memory/time budget)
     emit_mtp: bool = True         # add draft-mtp flags to server cmd if supported
     ngram: bool = False           # enable ngram self-speculative decoding sweep
+    ngram_type: str | None = None # pin the ngram variant (tuning stage / --ngram-type)
+    ngram_keep: int = 2           # variants carried from screen into tuning (top-K)
     spec_draft_n_max: int = 2     # --spec-draft-n-max for MTP
     profile: str = "single"       # workload profile (see PROFILES)
     driver: str = "bench"         # "bench" (llama-bench) or "server" (llama-server)
@@ -632,25 +634,23 @@ def build_factors(cfg: Config):
         factors["spec_n_min"] = ["1", "2"]
         factors["spec_p_min"] = ["0.0", "0.25", "0.5", "0.75", "0.9"]
         factors["spec_p_split"] = ["0.1", "0.3", "0.5"]
-    # ngram self-speculative decoding (server only): sweep the --spec-type variant
-    # plus each variant's CONDITIONAL tuning knobs (active_when — see
-    # docs/CONDITIONAL-FACTORS.md). ngram needs no draft model (it matches patterns
-    # in the token history) and complements MTP when both are active (--spec-type
-    # values combine). The map/simple variants share one collapsed knob set
-    # (flag_for resolves the variant spelling); ngram-mod has its own. Levels
-    # bracket llama.cpp's defaults within the documented bounds. spec_n_max is NOT
-    # added: --spec-draft-n-max is a draft-model/MTP knob, inert for ngram.
+    # ngram self-speculative decoding (server only). The --spec-type variant is a
+    # gate; its tuning knobs are CONDITIONAL (active_when — docs/CONDITIONAL-FACTORS.md)
+    # and must not share a flat array with the gate (that inflates the design and
+    # dilutes their effects). So build_factors emits only the GATE here — the
+    # Stage-0 "screen" that measures each variant at its default knobs. A variant's
+    # knobs enter the design only once the gate is pinned to it (a tuning stage,
+    # cfg.ngram_type — driven by run_ngram_stages or --ngram-type). ngram needs no
+    # draft model and complements MTP when both are active (--spec-type values
+    # combine). spec_n_max is NOT added: --spec-draft-n-max is a draft-model/MTP
+    # knob with no effect on ngram.
     if cfg.driver == "server" and cfg.ngram:
-        factors["ngram"] = ["none", "ngram-simple", "ngram-mod", "ngram-map-k",
-                            "ngram-map-k4v"]
-        # shared map/simple knobs (llama.cpp defaults: size_n=12, size_m=48, min_hits=1)
-        factors["ngram_size_n"]   = ["4", "8", "12", "16", "24"]
-        factors["ngram_size_m"]   = ["8", "16", "32", "48", "64"]
-        factors["ngram_min_hits"] = ["1", "2", "3", "5"]
-        # ngram-mod knobs (defaults: n_match=24, n_min=48, n_max=64)
-        factors["ngram_mod_n_match"] = ["8", "16", "24", "32", "48"]
-        factors["ngram_mod_n_min"]   = ["16", "32", "48", "64", "96"]
-        factors["ngram_mod_n_max"]   = ["32", "48", "64", "96", "128"]
+        if cfg.ngram_type:                         # tuning stage: gate pinned
+            factors["ngram"] = [cfg.ngram_type]
+            factors.update(ngram_child_levels(cfg.ngram_type))
+        else:                                      # screen stage: variants only
+            factors["ngram"] = ["none", "ngram-simple", "ngram-mod",
+                                "ngram-map-k", "ngram-map-k4v"]
     return factors
 
 
@@ -797,6 +797,29 @@ OT_PATTERNS = {
 # structure (differing only in the flag's variant token). ngram-mod has its own
 # {n-match, n-min, n-max}. See docs/ngram-design.md.
 NGRAM_MAP_VARIANTS = frozenset({"ngram-simple", "ngram-map-k", "ngram-map-k4v"})
+
+# Conditional-child level sets (levels bracket llama.cpp's defaults within the
+# documented bounds). These enter the design only in a variant's tuning stage —
+# see plan_stages / run_ngram_stages, docs/CONDITIONAL-FACTORS.md.
+NGRAM_MAP_LEVELS = {                      # ngram-simple / map-k / map-k4v
+    "ngram_size_n":   ["4", "8", "12", "16", "24"],   # default 12
+    "ngram_size_m":   ["8", "16", "32", "48", "64"],  # default 48
+    "ngram_min_hits": ["1", "2", "3", "5"],           # default 1
+}
+NGRAM_MOD_LEVELS = {                      # ngram-mod
+    "ngram_mod_n_match": ["8", "16", "24", "32", "48"],   # default 24
+    "ngram_mod_n_min":   ["16", "32", "48", "64", "96"],  # default 48
+    "ngram_mod_n_max":   ["32", "48", "64", "96", "128"], # default 64
+}
+
+
+def ngram_child_levels(variant: str) -> dict:
+    """The tuning-knob level sets for one ngram variant (empty for none/unknown)."""
+    if variant in NGRAM_MAP_VARIANTS:
+        return dict(NGRAM_MAP_LEVELS)
+    if variant == "ngram-mod":
+        return dict(NGRAM_MOD_LEVELS)
+    return {}
 
 # ---------------------------------------------------------------------------
 # Unified knob registry — the one place to add a tunable. Each factor declares
@@ -2602,18 +2625,23 @@ def selftest() -> bool:
         assert factor_flags(cfg_s, {"ngram": "none", "ngram_mod_n_match": "16",
                                     "ngram_size_n": "8"}, "server", 512) == []
 
-        # ngram builds include the collapsed knobs, and NOT spec_n_max (a
-        # draft-model knob, inert for ngram)
+        # ngram screen build: the gate only (no conditional children — those enter
+        # a variant's tuning stage), and NOT spec_n_max (a draft-model knob).
         cfg_n = Config(model=Path("m"), llama_bench=Path("b"), array="auto",
                        ctx_floor=8192, driver="server", ngram=True,
                        hw={"phys": 8, "logical": 16, "n_layers": 32,
                            "n_ctx_train": 32768, "n_experts": 0, "n_nextn": 0})
         nfs = build_factors(cfg_n)
-        assert "ngram" in nfs, f"ngram not in {list(nfs)}"
+        assert "ngram" in nfs and len(nfs["ngram"]) == 5, f"ngram not in {list(nfs)}"
         assert "spec_n_max" not in nfs, "spec_n_max must not be an ngram factor"
-        assert "ngram_size_n" in nfs and "ngram_mod_n_max" in nfs
-        assert not any(k.startswith("ngram_simple_") or k.startswith("ngram_map_")
-                       for k in nfs)          # collapsed away
+        assert not any(k.startswith("ngram_") and k != "ngram" for k in nfs), \
+            "screen build must exclude conditional children"
+        # a pinned variant (tuning stage) includes ONLY its own knobs
+        vf_mod = build_factors(replace(cfg_n, ngram_type="ngram-mod"))
+        assert vf_mod["ngram"] == ["ngram-mod"]
+        assert "ngram_mod_n_max" in vf_mod and "ngram_size_n" not in vf_mod
+        vf_simple = build_factors(replace(cfg_n, ngram_type="ngram-simple"))
+        assert "ngram_size_n" in vf_simple and "ngram_mod_n_max" not in vf_simple
 
         # I3: a conditional knob is scored only over rows where it was active.
         # ngram_size_n really matters within ngram-simple (best at "24"); rows on
@@ -2631,10 +2659,13 @@ def selftest() -> bool:
         assert "90.0" not in [f"{v}" for v in cond_means.values()]        # decoy row excluded
 
         # --- stage planner (docs/CONDITIONAL-FACTORS.md) ---
-        stages = plan_stages(nfs)
+        # feed the planner the FULL factor set (screen gate + every child) it would
+        # decompose; build_factors only ever emits one stage's worth at a time.
+        full = dict(nfs); full.update(NGRAM_MAP_LEVELS); full.update(NGRAM_MOD_LEVELS)
+        stages = plan_stages(full)
         assert stages[0]["name"] == "screen"
         # screen sweeps the gate at full spread but excludes conditional children
-        assert stages[0]["factors"]["ngram"] == nfs["ngram"]
+        assert stages[0]["factors"]["ngram"] == full["ngram"]
         assert not any(_active_when(f) for f in stages[0]["factors"])
         # one tuning stage per variant that has children (3 map + mod)
         tune = {s["value"]: s for s in stages if s["gate"] == "ngram"}
@@ -2656,6 +2687,37 @@ def selftest() -> bool:
                           "ngram_mod_n_max": ["32", "64"], "ngl": ["0", "64"]})
         assert [s["name"] for s in ps] == ["screen", "tune:ngram=ngram-mod"]
         assert "ngl" in ps[0]["factors"] and "ngram_mod_n_max" not in ps[0]["factors"]
+
+        # --- ngram staging helpers (run_ngram_stages) ---
+        screen_rows = [
+            {"status": "OK", "ngram": "ngram-mod", "pp_tps": 100.0, "tg_tps": 30.0,
+             "ngl": "64", "n_depth": "0", "n_prompt": 0, "n_gen": 128},
+            {"status": "OK", "ngram": "ngram-simple", "pp_tps": 100.0, "tg_tps": 25.0,
+             "ngl": "64", "n_depth": "0", "n_prompt": 0, "n_gen": 128},
+            {"status": "OK", "ngram": "none", "pp_tps": 100.0, "tg_tps": 20.0,
+             "ngl": "32", "n_depth": "0", "n_prompt": 0, "n_gen": 128},
+            {"status": "OOM", "ngram": "ngram-map-k", "pp_tps": 0.0, "tg_tps": 0.0,
+             "ngl": "64", "n_depth": "0", "n_prompt": 0, "n_gen": 128},
+        ]
+        ranked = rank_gate_values(screen_rows, "ngram")
+        assert [v for v, _ in ranked][:2] == ["ngram-mod", "ngram-simple"]  # best first
+        assert keep_top_gate_values(ranked, 2) == ["ngram-mod", "ngram-simple"]
+        assert keep_top_gate_values(ranked, 1) == ["ngram-mod"]             # --ngram-fast
+        assert "none" not in keep_top_gate_values(ranked, 5)                # never tune "off"
+        held = screen_base_winners(cfg_n, {"ngl": ["32", "64"], "n_depth": ["0", "4096"],
+                                           "ngram": nfs["ngram"]}, screen_rows)
+        assert "ngram" not in held                                         # gate pinned separately
+        assert held["ngl"] == ["64"]                                       # settled at winner
+        assert held["n_depth"] == ["0", "4096"]                            # tradeoff axis kept
+        # child argv carries --ngram-type for a pinned tuning stage
+        class _A:  # minimal args stand-in for build_child_argv
+            model = Path("m"); no_mtp = no_shuffle = no_thermal_wait = False
+            thermal_baseline = seed = max_depth = None; timeout = 60; cooldown = 0
+            confirm = full_ = html = None; no_probe = False; verify_picks = 2
+            merge_results = []
+        _av = build_child_argv(_A, replace(cfg_n, ngram_type="ngram-mod"),
+                               {"ngl": ["64"]}, Path("r.csv"), False, [])
+        assert "--ngram-type" in _av and _av[_av.index("--ngram-type") + 1] == "ngram-mod"
 
         # spec-type merging: mtp + ngram both present → comma-separated
         merged = _merge_spec_type_parts(["--spec-type draft-mtp", "--spec-type ngram-mod"])
@@ -3005,6 +3067,8 @@ def build_child_argv(args, cfg: Config, factors: dict, results_path: Path,
         argv.append("--no-mtp")
     if cfg.ngram:
         argv.append("--ngram")
+    if cfg.ngram_type:                             # tuning stage: pin the variant
+        argv += ["--ngram-type", cfg.ngram_type]
     if cfg.measure_vram:
         argv.append("--vram")
     if args.no_shuffle:
@@ -3074,6 +3138,106 @@ def run_iterations(args, cfg: Config):
         factors = refined
     print(f"\nAll passes complete. Final report + results (all passes merged): "
           f"{base.with_name(f'{base.stem}.pass{args.iterate}{suffix}')}")
+
+
+def rank_gate_values(rows: list[dict], gate: str) -> list[tuple]:
+    """(gate value, best measured objective) over OK rows, best first. Used to
+    rank ngram variants after the screen stage."""
+    best: dict[str, float] = {}
+    for r in rows:
+        if r.get("status") != "OK":
+            continue
+        v = str(r.get(gate, ""))
+        if not v:
+            continue
+        s = score_of(r)
+        if v not in best or s > best[v]:
+            best[v] = s
+    return sorted(best.items(), key=lambda kv: kv[1], reverse=True)
+
+
+def keep_top_gate_values(ranked: list[tuple], k: int) -> list[str]:
+    """The top-k gate values worth tuning: the best `k` real variants (never the
+    'none'/off value unless nothing else was measured). At least one when any real
+    variant exists."""
+    real = [v for v, _ in ranked if v not in ("none", "")]
+    return real[:max(1, k)] if real else [v for v, _ in ranked[:1]]
+
+
+def screen_base_winners(cfg: Config, screen_factors: dict, rows: list[dict]) -> dict:
+    """Hold the unconditional knobs at their screen-winning level for the tuning
+    stage (so its runs are about the ngram knobs), keeping n_depth's full spread
+    (the tradeoff axis, per DESIGN.md). The gate is pinned separately."""
+    held: dict = {}
+    for name, levels in screen_factors.items():
+        if name == "ngram":
+            continue
+        if name == "n_depth":
+            held[name] = levels                        # tradeoff axis: keep spread
+            continue
+        means = factor_level_means(rows, name)
+        best = max(means, key=means.get) if means else str(levels[0])
+        held[name] = [str(best)]                        # settle at the screen winner
+    return held
+
+
+def run_ngram_stages(args, cfg: Config):
+    """Staged ngram search (docs/CONDITIONAL-FACTORS.md): a screen stage measures
+    every variant at default knobs, then one tuning stage per surviving variant
+    sweeps only that variant's knobs (gate pinned) with the unconditional knobs
+    held at the screen winners. The final answer is the best MEASURED config across
+    all stages (each stage merges the earlier ones). Each stage is a child of the
+    single-pass tool, exactly like --iterate passes."""
+    base = args.results
+    suffix = base.suffix or ".csv"
+
+    # Stage 0 — screen: sweep the parent's finalized factor set (base + gate, no
+    # conditional children since cfg.ngram_type is unset), passed explicitly so the
+    # child inherits the KV floor and any --factor overrides (as --iterate does).
+    screen_factors = cfg.factors
+    screen_rp = base.with_name(f"{base.stem}.ngram-screen{suffix}")
+    print("\n" + "#" * 70)
+    print("# NGRAM STAGE 0 — screen variants at default knobs")
+    print("#" * 70, flush=True)
+    argv = build_child_argv(args, cfg, screen_factors, screen_rp, final=False, prev=[])
+    env = {**os.environ, "LLAMA_OPTIMIZE_CHILD": "1"}
+    rc = subprocess.call([sys.executable, os.path.abspath(__file__), *argv], env=env)
+    if rc != 0:
+        print(f"\nngram screen exited with code {rc}; stopping.")
+        return
+    rows = load_results_csv(screen_rp, screen_factors)
+    if not rows:
+        print("no screen results; stopping.")
+        return
+
+    ranked = rank_gate_values(rows, "ngram")
+    kept = keep_top_gate_values(ranked, cfg.ngram_keep)
+    print("\nngram screen ranking (best measured objective per variant):")
+    for v, s in ranked:
+        print(f"  {v:<14} {s:.2f}" + ("   → tuning" if v in kept else ""))
+    held = screen_base_winners(cfg, screen_factors, rows)
+
+    # Stage k — tune each surviving variant; the last one produces the final report.
+    prev = [screen_rp]
+    tunable = [v for v in kept if ngram_child_levels(v)]
+    if not tunable:
+        print("\nno surviving variant has tunable knobs; screen result stands.")
+        return
+    for i, v in enumerate(tunable):
+        final = i == len(tunable) - 1
+        rp = base.with_name(f"{base.stem}.ngram-{v}{suffix}")
+        print("\n" + "#" * 70)
+        print(f"# NGRAM STAGE {i + 1} — tune {v}")
+        print("#" * 70, flush=True)
+        cfg_v = replace(cfg, ngram_type=v)             # pin gate ⇒ child sweeps its knobs
+        argv = build_child_argv(args, cfg_v, held, rp, final, prev)
+        rc = subprocess.call([sys.executable, os.path.abspath(__file__), *argv], env=env)
+        if rc != 0:
+            print(f"\nngram tuning of {v} exited with code {rc}; stopping.")
+            return
+        prev.append(rp)
+    print(f"\nNgram staging complete. Final report + results (all stages merged): "
+          f"{prev[-1]}")
 
 
 # ---------------------------------------------------------------------------
@@ -3316,9 +3480,19 @@ def main():
                     help="don't add draft-mtp flags to the emitted server command "
                          "even if the model has an MTP head")
     ap.add_argument("--ngram", action="store_true",
-                    help="enable ngram self-speculative decoding (server only): "
-                         "sweeps all ngram variants and their parameters to find "
-                         "the optimal pattern-matching speculation for your workload")
+                    help="enable ngram self-speculative decoding (server only): a "
+                         "screen stage measures every variant, then the top variants "
+                         "get their parameters tuned (staged so the search stays "
+                         "clean and affordable — see docs/CONDITIONAL-FACTORS.md)")
+    ap.add_argument("--ngram-type", default=None,
+                    choices=["ngram-simple", "ngram-mod", "ngram-map-k", "ngram-map-k4v"],
+                    help="pin the ngram variant and tune only its parameters in one "
+                         "pass (skips the variant screen)")
+    ap.add_argument("--ngram-keep", type=int, default=2, metavar="K",
+                    help="how many top variants from the screen to tune (default 2)")
+    ap.add_argument("--ngram-fast", action="store_true",
+                    help="greedy ngram search: tune only the single best-screened "
+                         "variant (--ngram-keep 1)")
     ap.add_argument("--no-probe", action="store_true",
                     help="skip the max-context probe (which runs by default after "
                          "the sweep: binary-searches the physical context ceiling)")
@@ -3479,6 +3653,9 @@ def main():
     # measured nor tunable (its knobs are server-only). An explicit --driver or
     # --use-case still wins, as does --no-mtp; needs llama-server built.
     # ngram self-speculation is also server-only.
+    if args.ngram_fast:
+        args.ngram_keep = 1
+    args.ngram = args.ngram or args.ngram_type is not None   # --ngram-type implies ngram
     if (driver == "bench" and args.driver is None and uc.get("driver") is None
             and (n_nextn or 0) > 0 and not args.no_mtp and llama_server.exists()):
         driver = "server"
@@ -3502,6 +3679,8 @@ def main():
         max_depth=args.max_depth,
         emit_mtp=not args.no_mtp,
         ngram=args.ngram,
+        ngram_type=args.ngram_type,
+        ngram_keep=args.ngram_keep,
         spec_draft_n_max=args.spec_draft_n_max,
         profile=profile,
         driver=driver,
@@ -3609,6 +3788,16 @@ def main():
             ap.error("--screen needs --run")
         morris_screen(cfg, args, ap, args.screen)
 
+    # ngram staged search: a screen stage measures every variant, then the top-K
+    # get their knobs tuned (gate pinned). Only the unpinned parent orchestrates —
+    # a --ngram-type child (pinned gate) runs as a normal single-variant sweep.
+    if (cfg.ngram and cfg.ngram_type is None and cfg.driver == "server"
+            and not os.environ.get("LLAMA_OPTIMIZE_CHILD")):
+        if not args.run:
+            ap.error("--ngram needs --run")
+        run_ngram_stages(args, cfg)
+        return
+
     # iterative refinement: orchestrate N passes as subprocesses of this tool
     if args.iterate > 1 and not (os.environ.get("LLAMA_OPTIMIZE_CHILD")):
         if not args.run:
@@ -3640,8 +3829,12 @@ def main():
             print("             hint: add --driver server to MEASURE the MTP "
                   "speedup (bench can't); otherwise it's only emitted")
     if cfg.ngram:
-        emit = ("swept as factors (ngram type + params)" if "ngram" in cfg.factors
-                else "will add --spec-type ngram-mod to server cmd")
+        if cfg.ngram_type:
+            emit = f"tuning {cfg.ngram_type} knobs (variant pinned)"
+        elif "ngram" in cfg.factors:
+            emit = "screening variants (tuning follows for the top ones)"
+        else:
+            emit = "will add --spec-type ngram-mod to server cmd"
         print(f"ngram      : yes — {emit}")
     print(f"profile    : {cfg.profile}  (request {cfg.n_prompt} prompt + "
           f"{cfg.n_gen} gen tokens; driver={cfg.driver})")
