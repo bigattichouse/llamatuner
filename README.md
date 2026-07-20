@@ -134,10 +134,9 @@ Swept by default (auto-scaled to your hardware and model):
 | MoE expert offload | `-ncmoe`   | `0 .. n_layers` (5 levels)             | **MoE models** (replaces `-ot`): how many layers keep experts on CPU |
 | NUMA policy   | `--numa`         | `distribute, isolate`                  | **multi-NUMA-node boxes only** (inert on one node) |
 | Prefill threads | `-tb`          | same levels as `-t`                    | **server driver**: decode vs prefill thread split |
-| ngram on/off   | `--spec-type <variant>` | `none, ng-simple, ng-mod, ng-map-k, ng-map-k4v` | **server driver, --ngram**: which ngram pattern-matching variant to use |
-| ngram draft len | `--spec-draft-n-max` | `1..16`                              | **server driver, --ngram**: shared draft length for ngram speculation |
-| ngram map params | `--spec-ngram-*-size-n/m, -min-hits` | `4..24 / 8..64 / 1..5`  | **server driver, --ngram**: lookup n-gram, draft m-gram, and min hit thresholds |
-| ngram mod params | `--spec-ngram-mod-n-match/min/max` | `8..48 / 16..96 / 32..128` | **server driver, --ngram**: ngram-mod hasher lookup length and range |
+| ngram variant  | `--spec-type <variant>` | `none, ng-simple, ng-mod, ng-map-k, ng-map-k4v` | **server driver, --ngram**: which pattern-matching variant — *screened* first (see [ngram staging](#ngram-staged-search)) |
+| ngram map params | `--spec-ngram-<variant>-size-n/m, -min-hits` | `4..24 / 8..64 / 1..5`  | **--ngram tuning stage**: lookup n-gram, draft m-gram, and min hit thresholds (ngram-simple / map-k / map-k4v) |
+| ngram mod params | `--spec-ngram-mod-n-match/min/max` | `8..48 / 16..96 / 32..128` | **--ngram tuning stage**: ngram-mod hasher lookup length and range |
 | MTP on/off    | `--spec-type draft-mtp` | `1, 0`                          | **MTP models, server driver**: measures what speculative decoding actually buys |
 | MTP draft len | `--spec-draft-n-max` / `-min` | `1..6` / `1, 2`           | **MTP models, server driver**: speculative draft lengths |
 | MTP acceptance | `--spec-draft-p-min` / `-p-split` | `0.0..0.9` / `0.1..0.5` | **MTP models, server driver**: draft acceptance thresholds |
@@ -479,9 +478,13 @@ python3 llama-optimize.py MODEL.gguf [options]
   --n-gen N          generated tokens per measurement (default: from profile)
   --n-prompt N       prompt tokens per measurement (default: from profile)
   --no-mtp           don't add draft-mtp flags to the server command
-  --ngram            enable ngram self-speculative decoding sweep (server only):
-                     tests all ngram variants + their tunable parameters to find
-                     the optimal pattern-matching speculation for your workload
+  --ngram            enable ngram self-speculative decoding (server only): a
+                     screen stage measures every variant, then the top variants
+                     get their parameters tuned (staged, see ngram staging below)
+  --ngram-type V     pin the ngram variant and tune only its parameters in one
+                     pass (ngram-simple | ngram-mod | ngram-map-k | ngram-map-k4v)
+  --ngram-keep K     how many top screened variants to tune (default: 2)
+  --ngram-fast       greedy: tune only the single best-screened variant (K=1)
   --no-probe         skip the max-context probe (runs by default: binary-searches
                      the physical context ceiling for the furthest-reaching config,
                      reported as PROBED CEILING with a ready command at ~90% of it)
@@ -512,8 +515,9 @@ python3 llama-optimize.py MODEL.gguf [options]
   --selftest         run offline logic checks and exit (no GPU, no model)
   --server-start-timeout SECS  give up on a config if llama-server doesn't load
                      in this long (default: 180; also fails fast if it dies)
-  --spec-draft-n-max N  draft tokens for speculative decoding, shared by MTP and
-                     ngram (default: 2; --ngram overrides to 16 when not swept)
+  --spec-draft-n-max N  draft tokens for MTP / draft-model speculative decoding
+                     (default: 2). Not used by ngram (ngram variants carry their
+                     own draft-length knobs)
   --thinking         tune for reasoning workloads (long decode, n_gen~2048);
                      default is non-thinking / short answers
   --timeout SECS     per-run timeout (default: 1200)
@@ -580,15 +584,13 @@ registry in `llama-optimize.py`.
 | `ot` | `-ot` | both | cat | swept¹ | per-tensor placement — the VRAM-fit lever (named patterns below) |
 | `threads_batch` | `-tb` | server | num | swept | CPU threads for prompt processing |
 | `parallel` | `--parallel` | server | num | opt-in | concurrent request streams (multi) |
-| `ngram` | `--spec-type <variant>` | server | cat | swept⁴ | ngram self-speculation variant: none, ngram-simple, ngram-mod, ngram-map-k, ngram-map-k4v |
-| `spec_n_max` | `--spec-draft-n-max` | server | num | swept³ ⁴ | max draft tokens (shared MTP + ngram) |
-| `ngram_simple_size_n` | `--spec-ngram-simple-size-n` | server | num | swept⁴ | lookup n-gram length (ngram-simple) |
-| `ngram_simple_size_m` | `--spec-ngram-simple-size-m` | server | num | swept⁴ | draft m-gram length (ngram-simple) |
-| `ngram_simple_min_hits` | `--spec-ngram-simple-min-hits` | server | num | swept⁴ | min hits to draft (ngram-simple) |
-| `ngram_map_k_size_n/m, _min_hits` | `--spec-ngram-map-k-*` | server | num | swept⁴ | same structure for ngram-map-k |
-| `ngram_map_k4v_size_n/m, _min_hits` | `--spec-ngram-map-k4v-*` | server | num | swept⁴ | same structure for ngram-map-k4v |
-| `ngram_mod_n_match/min/max` | `--spec-ngram-mod-n-*` | server | num | swept⁴ | ngram-mod hasher: lookup length, min/max range |
+| `ngram` | `--spec-type <variant>` | server | cat | swept⁴ | ngram self-speculation variant (the gate): none, ngram-simple, ngram-mod, ngram-map-k, ngram-map-k4v |
+| `ngram_size_n` | `--spec-ngram-<v>-size-n` | server | num | tuning⁴ | lookup n-gram length (ngram-simple / map-k / map-k4v — one factor, variant-spelled) |
+| `ngram_size_m` | `--spec-ngram-<v>-size-m` | server | num | tuning⁴ | draft m-gram length (simple / map-k / map-k4v) |
+| `ngram_min_hits` | `--spec-ngram-<v>-min-hits` | server | num | tuning⁴ | min hits to draft (simple / map-k / map-k4v) |
+| `ngram_mod_n_match/min/max` | `--spec-ngram-mod-n-*` | server | num | tuning⁴ | ngram-mod hasher: lookup length, min/max range |
 | `mtp` | `--spec-type draft-mtp` | server | cat | swept³ | speculative decoding via the model's MTP head, on/off |
+| `spec_n_max` | `--spec-draft-n-max` | server | num | swept³ | max draft tokens (MTP / draft-model only — **not** ngram) |
 | `spec_n_min` | `--spec-draft-n-min` | server | num | swept³ | MTP draft tokens (min) |
 | `spec_p_min` | `--spec-draft-p-min` | server | float | swept³ | MTP acceptance-probability threshold |
 | `spec_p_split` | `--spec-draft-p-split` | server | float | swept³ | MTP split probability |
@@ -598,8 +600,12 @@ registry in `llama-optimize.py`.
 architecture).  ² fixed on unless swept (precondition for KV-quant; pair with
 `--min-kv f16`).  ³ swept when the model ships an MTP/NextN head — such models also
 auto-switch to the server driver so the effect is measured (`--no-mtp` disables).
-⁴ swept when `--ngram` is passed (server driver auto-switches).  ngram needs no
-draft model — it pattern-matches from the token history.
+⁴ with `--ngram` (server driver auto-switches), the *variant* is screened first;
+each variant's tuning knobs are then swept only in that variant's tuning stage —
+they never share one array with the gate (see [ngram staging](#ngram-staged-search)).
+ngram needs no draft model — it pattern-matches from the token history.  Note
+`spec_n_max` (`--spec-draft-n-max`) is a draft-model/MTP knob and has **no effect
+on ngram**, so it is not an ngram factor.
 
 **`-ot` named patterns** (translate to real tensor regexes): `none`, `ffn_cpu`,
 `ffn_up_cpu`, `exps_cpu`, `attn_cpu`.
@@ -617,13 +623,38 @@ python3 llama-optimize.py model-UD.gguf --run --driver server \
 python3 llama-optimize.py model.gguf --run \
   --env GGML_CUDA_FORCE_MMQ=0,1 --env GGML_CUDA_FORCE_CUBLAS=0,1
 
-# tune the ngram self-speculation surface (server driver)
+# search the ngram self-speculation surface (server driver, staged)
 python3 llama-optimize.py model.gguf --run --driver server --ngram
+# or pin one variant and tune just its knobs in a single pass
+python3 llama-optimize.py model.gguf --run --driver server --ngram-type ngram-mod
 
 **Notes.** MTP/spec and concurrency knobs need `--driver server` (llama-bench can't
 do them). Keep the number of levels-per-factor uniform where you can — mixing 2- and
 5-level factors forces a much larger array. `--iterate` refines numeric knobs on a
 finer grid and keeps the top levels of categorical ones.
+
+<a name="ngram-staged-search"></a>
+### ngram staged search
+
+The ngram `--spec-type` variants (`ngram-simple`, `ngram-mod`, `ngram-map-k`,
+`ngram-map-k4v`) each have their **own** tuning knobs that mean nothing to the
+others — a knob is only live when its variant is selected. Putting all of them in
+one orthogonal array would send flags for the wrong variant, blow the run count up
+(L25 → L125), and dilute every knob's measured effect (each is inert in most rows).
+So `--ngram` runs a **staged search** instead:
+
+1. **Screen** — measure every variant at its default knobs in one clean array.
+2. **Keep the top `--ngram-keep` variants** (default 2; `--ngram-fast` keeps just
+   the best). Only clearly-worse variants are dropped, so a variant that shines
+   only once tuned still gets its chance.
+3. **Tune each survivor** — one clean array per variant sweeps only *that* variant's
+   knobs, with the other (non-ngram) knobs held at their screen winners.
+
+The reported pick is the best **measured** config across all stages. To skip the
+screen and tune one variant directly, use `--ngram-type <variant>`. Background and
+the general mechanism for this kind of conditional parameter are in
+[`docs/CONDITIONAL-FACTORS.md`](docs/CONDITIONAL-FACTORS.md) and
+[`docs/ngram-design.md`](docs/ngram-design.md).
 
 ---
 
