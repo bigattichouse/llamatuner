@@ -129,13 +129,18 @@ already covered: `ngram-mod` → `n-max`; `ngram-simple/map-k/map-k4v` → `size
 
 `size_*`/`min_hits` are `uint16`. The PR's sweep levels sit inside these bounds.
 
-**3. Coupled-constraint caution.** `ngram_mod_n_min ≤ n_max` is the implied
-relation (defaults 48 ≤ 64). The PR sweeps `n_min` up to 96 and `n_max` from 32,
-so an OA row can produce `n_min=96, n_max=32`. Whether llama.cpp rejects or just
-underperforms on inverted bounds is unverified; the Stage-k design should either
-constrain the pair or record that inverted rows are expected-poor, not crashes.
-This is a second general pattern (sibling parameters with an ordering constraint)
-worth a note in `CONDITIONAL-FACTORS.md` if it recurs.
+**3. Coupled-constraint — decided: no clamp.** `ngram_mod_n_min ≤ n_max` is the
+implied relation (defaults 48 ≤ 64), and the sweep can produce inverted rows
+(`n_min=96, n_max=32`). Verified against llama.cpp: inverted bounds are **legal**
+(`arg.cpp` only enforces 0–1024 per value, independently) and **do not crash** —
+`ngram-mod` drafts at most `n_max` tokens (`speculative.cpp:986`), and a draft
+shorter than `n_min` is simply rejected (`speculative.cpp:748`), so an inverted
+row accepts no draft tokens and runs at ~baseline. It therefore **self-
+deprioritizes**: it scores at/below the non-speculative baseline and the Pareto /
+main-effects naturally rank it last. We deliberately do **not** clamp — clamping
+would desync the CSV factor level from the config actually run and hide that real
+signal. (The general "sibling ordering constraint" pattern is noted in
+`CONDITIONAL-FACTORS.md`; the chosen policy here is "accept as expected-poor".)
 
 **Deliberate exclusion:** the `ngram-cache` spec type exists but is omitted — it
 needs external static/dynamic cache files (`--lookup-cache-static/-dynamic`), not
@@ -234,22 +239,25 @@ ngram conversion:
       for ngram); keep it swept only under MTP.
 - [x] Replace `_ngram_param_inactive` with `is_active` in `factor_flags`.
 - [x] Condition `factor_level_means` on `is_active` (invariant I3).
-- [ ] Decide handling of inverted `ngram_mod_n_min > n_max` rows (constrain or
-      record as expected-poor, not crash).
+- [x] Inverted `ngram_mod_n_min > n_max` rows: decided **no clamp** — legal,
+      no crash, self-deprioritizing (see "Verified against llama.cpp" #3).
 
 Staging:
 
 - [x] Stage planner (`plan_stages`) with the liveness property test.
-- [ ] Keep-contenders policy (top-`K`, default `K=2`) + `--ngram-fast` (`K=1`)
-      and a tune-all mode; drop only clearly-dominated variants.
-- [ ] Executor: run the screen stage, keep top-`K`, run each survivor's tuning
-      stage, pick the best MEASURED config across stages (wire `plan_stages` into
-      `run_iterations` / the single-pass path; `build_factors` screen exclusion).
-- [ ] `refine_factors` transition: open the children of each *surviving* gate
-      value (not just the argmax) next pass.
-- [ ] `--ngram-type` flag (single-pass Stage k).
-- [ ] Report notes: single pass ranks variants at defaults; `--iterate ≥ 2`
-      needed for per-variant tuning.
+- [x] Keep-contenders policy: `--ngram-keep` (top-`K`, default 2) + `--ngram-fast`
+      (`K=1`); `keep_top_gate_values` never tunes the "none"/off variant.
+- [x] Executor `run_ngram_stages`: `build_factors` screen-exclusion (gate only)
+      and a `cfg.ngram_type` pin; screen child → rank → keep top-`K` → one
+      `--ngram-type` tuning child per survivor (base held at screen winners,
+      n_depth spread) → best MEASURED config across merged stages.
+      (Realised via the orchestrator + `--ngram-type` children rather than a
+      `refine_factors` gate transition — same intent, cleaner separation.)
+- [x] `--ngram-type` flag (single-pass Stage k).
+- [x] Banner reflects screen vs tune; report note that per-variant tuning is the
+      staged flow. *(Not validated end-to-end on a GPU yet.)*
+- [ ] Optional: let tuning stages themselves refine over `--iterate` passes
+      (currently one tuning pass per variant).
 
 Submodule:
 
