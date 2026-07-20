@@ -15,8 +15,8 @@ jobs:
       - name: Selftest (stdlib only, no submodule build needed)
         run: python3 llama-optimize.py --selftest
 
-      - name: Build robust/taguchi submodule
-        run: make -C taguchi
+      - name: Build robust submodule
+        run: make -C robust
 
       # The selftest deliberately avoids the array binding; exercise the paths
       # that need it: array generation (incl. L125, mixed levels riding 5-level

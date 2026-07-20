@@ -2,7 +2,7 @@
 """CI smoke test for the taguchi-binding paths the selftest deliberately skips:
 orthogonal-array generation (incl. L125 and mixed level counts riding 5-level
 columns) and the main-effects analyzer. Needs the submodule built
-(`make -C taguchi`); no GPU, no model."""
+(`make -C robust`); no GPU, no model."""
 import importlib.util
 import random
 from pathlib import Path
