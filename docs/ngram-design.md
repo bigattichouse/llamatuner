@@ -220,28 +220,31 @@ also renamed the Python package before assuming `import taguchi` stays valid.
 
 Declarative core (no behavior change for existing factors):
 
-- [ ] Add `active_when` + `flag_for` support to the `FACTORS` schema.
-- [ ] Implement `is_active(name, assignment)` and `active_factors(...)`.
-- [ ] Registry validator (gate exists, values are real levels, `flag_for` total,
+- [x] Add `active_when` + `flag_for` support to the `FACTORS` schema.
+- [x] Implement `is_active(name, assignment)` and `active_factors(...)`.
+- [x] Registry validator (gate exists, values are real levels, `flag_for` total,
       gate graph acyclic); run in `selftest` and assert at `build_factors` time.
 
 ngram conversion:
 
-- [ ] Move ngram entries to `active_when`; collapse the 9 shared knobs to 3 via
+- [x] Move ngram entries to `active_when`; collapse the 9 shared knobs to 3 via
       `flag_for`; set documented defaults (from the verified table above).
-- [ ] **Drop `spec_n_max` from the ngram sweep** and remove the
+- [x] **Drop `spec_n_max` from the ngram sweep** and remove the
       `--spec-draft-n-max 16` ngram default (it's a draft-model/MTP knob, inert
       for ngram); keep it swept only under MTP.
-- [ ] Replace `_ngram_param_inactive` with `is_active` in `factor_flags`.
-- [ ] Condition `factor_level_means` on `is_active` (invariant I3).
+- [x] Replace `_ngram_param_inactive` with `is_active` in `factor_flags`.
+- [x] Condition `factor_level_means` on `is_active` (invariant I3).
 - [ ] Decide handling of inverted `ngram_mod_n_min > n_max` rows (constrain or
       record as expected-poor, not crash).
 
 Staging:
 
-- [ ] Stage planner (`plan_stages`) with the liveness property test.
+- [x] Stage planner (`plan_stages`) with the liveness property test.
 - [ ] Keep-contenders policy (top-`K`, default `K=2`) + `--ngram-fast` (`K=1`)
       and a tune-all mode; drop only clearly-dominated variants.
+- [ ] Executor: run the screen stage, keep top-`K`, run each survivor's tuning
+      stage, pick the best MEASURED config across stages (wire `plan_stages` into
+      `run_iterations` / the single-pass path; `build_factors` screen exclusion).
 - [ ] `refine_factors` transition: open the children of each *surviving* gate
       value (not just the argmax) next pass.
 - [ ] `--ngram-type` flag (single-pass Stage k).
