@@ -3201,7 +3201,7 @@ def run_ngram_stages(args, cfg: Config):
     print("\n" + "#" * 70)
     print("# NGRAM STAGE 0 — screen variants at default knobs")
     print("#" * 70, flush=True)
-    argv = build_child_argv(args, cfg, screen_factors, screen_rp, final=False, prev=[])
+    argv = build_child_argv(args, cfg, screen_factors, screen_rp, False, [])
     env = {**os.environ, "LLAMA_OPTIMIZE_CHILD": "1"}
     rc = subprocess.call([sys.executable, os.path.abspath(__file__), *argv], env=env)
     if rc != 0:
